@@ -1,0 +1,143 @@
+# sqlite-prefetch
+
+A Go library for intelligently prefetching [SQLite database pages](https://www.sqlite.org/fileformat2.html#pages) from remote storage (S3, peer nodes, or any custom backend). Zero external dependencies.
+
+## The problem
+
+SQLite stores data in fixed-size pages organized as [B-trees](https://www.sqlite.org/fileformat2.html#b_tree_pages). When the database lives on remote storage (object stores, distributed caches), every page fault becomes a network round-trip. A simple table scan that touches hundreds of pages serializes into hundreds of sequential fetches, each blocked on network latency.
+
+Traditional prefetchers use sequential or stride heuristics to guess what pages come next. These work for flat files but break down on SQLite databases, where B-tree traversal jumps between non-contiguous pages and [VACUUM](https://www.sqlite.org/lang_vacuum.html)-fragmented databases have no predictable layout on disk.
+
+## The approach
+
+SQLite's own [B-tree interior pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) already contain the answer: each interior page stores an array of child page pointers (typically ~450 per 4KB page). By parsing these pages as they're fetched, we can predict exactly which leaf pages will be needed next — no heuristics required. A single interior page hit yields all of its children, converging queries to 1-2 blocking faults per B-tree level regardless of fragmentation.
+
+The library combines this B-tree prediction with adaptive readahead, multi-source scheduling, and peer routing into a composable set of components:
+
+| Component | Role |
+|---|---|
+| **Prefetcher** | Entry point. Deduplicates concurrent faults so parallel readahead and application reads share a single in-flight fetch per page. |
+| **Scheduler** | Ranks multiple storage backends by estimated cost (`latency + size/bandwidth`) and issues [hedged requests](https://research.google/pubs/the-tail-at-scale/) to cut tail latency. |
+| **ReadaheadEngine** | Classifies access patterns (sequential, stride, random), sizes a prefetch window using [AIMD](https://en.wikipedia.org/wiki/Additive_increase/multiplicative_decrease), and backs off when prefetched pages go unused. |
+| **btreeTracker** | Parses [interior table pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) (page flag `0x05`) for exact child-page prediction, with multi-level lookahead to stay ahead of SQLite's descent. |
+| **PeerRouter** | Learns which peer nodes cache which pages via fetch outcomes, using [EWMA](https://en.wikipedia.org/wiki/Exponential_smoothing) hit-rate tracking and B-tree sibling amplification to route requests efficiently. |
+
+Each component is optional. You can use just the `Prefetcher` for deduplication, add the `Scheduler` for multi-source fetching, or enable the full stack for autonomous B-tree-aware prefetching.
+
+## Install
+
+```
+go get github.com/wjordan/sqlite-prefetch
+```
+
+## Usage
+
+```go
+import "github.com/wjordan/sqlite-prefetch"
+
+// Implement these interfaces for your storage layer.
+var cache prefetch.PageCache   // Get/Put/Has for cached pages
+var source prefetch.PageSource // GetPage from your backend (S3, disk, etc.)
+
+// Create the prefetcher.
+p := prefetch.New(source, cache)
+
+// Optional: multi-source scheduling with hedged requests.
+sched := prefetch.NewScheduler(prefetch.SchedulerConfig{})
+sched.SetSources([]prefetch.Source{s3Source, peerSource})
+p.SetScheduler(sched)
+
+// Optional: readahead with B-tree awareness.
+wt := prefetch.NewWasteTracker()
+re := prefetch.NewReadaheadEngine(p, sched, cache, wt, prefetch.ReadaheadConfig{})
+p.SetReadahead(re)
+
+// Fetch pages — dedup, readahead, and B-tree prediction happen automatically.
+data, err := p.GetPage(ctx, pageNo)
+```
+
+## Interfaces
+
+Integrate with your storage layer by implementing two interfaces:
+
+```go
+// PageSource fetches page data from storage.
+type PageSource interface {
+    GetPage(ctx context.Context, pageNo int64) ([]byte, error)
+}
+
+// PageCache reads and writes cached pages.
+type PageCache interface {
+    Get(pageNo int64) ([]byte, bool)
+    CopyTo(pageNo int64, dst []byte) (int, bool)
+    Put(pageNo int64, data []byte)
+    PutPrefetched(pageNo int64, data []byte) // tracks waste on eviction
+    Has(pageNo int64) bool
+}
+```
+
+For multi-source scheduling, implement `Source`:
+
+```go
+type Source interface {
+    Name() string
+    Latency() time.Duration
+    Bandwidth() float64
+    Completeness() float64
+    EgressCost() float64
+    HasPage(pageNo int64) bool
+    GetPage(ctx context.Context, pageNo int64) ([]byte, error)
+}
+```
+
+For peer-to-peer fetching, implement `PeerTransport`:
+
+```go
+type PeerTransport interface {
+    OpenStream(ctx context.Context, addr string) (io.ReadWriteCloser, error)
+}
+```
+
+## How it works
+
+### B-tree prediction
+
+SQLite interior table pages (flag `0x05`) contain an array of child page pointers — typically ~450 children per 4KB page. When the prefetcher fetches an interior page, the `btreeTracker` parses it and records the parent-to-child mapping. On the next leaf page fault, `Predict()` returns all remaining siblings, letting the engine prefetch them before SQLite asks.
+
+When remaining siblings drop below a threshold, multi-level lookahead prefetches the *next interior sibling* so its children are parsed before SQLite descends into them.
+
+See: [SQLite file format: Interior Pages of Table B-Trees](https://www.sqlite.org/fileformat2.html#b_tree_pages)
+
+### Hedged requests
+
+The `Scheduler` implements [hedged requests](https://research.google/pubs/the-tail-at-scale/) from Google's "The Tail at Scale" (Dean & Barroso, 2013). It starts the best source immediately and fires a fallback after `1.5x best_latency`. The first successful response wins; the other is cancelled.
+
+### Adaptive readahead
+
+The `ReadaheadEngine` uses:
+- **Pattern classification** -- ring buffer of recent pages with delta analysis to detect sequential (+1), stride (constant delta), or random access (inspired by [Leap](https://www.usenix.org/conference/atc20/presentation/maruf), USENIX ATC '20)
+- **[AIMD](https://en.wikipedia.org/wiki/Additive_increase/multiplicative_decrease) window** -- doubles on confirmed prediction, halves on miss
+- **Depth limiting** -- `ceil(workers x source_latency / inter_fault_interval)` bounds prefetch to what can complete before the next fault
+- **Waste feedback** -- tracks eviction of prefetched-but-never-read pages, shrinks max window when waste exceeds 30%
+
+### Peer routing
+
+The `PeerRouter` learns which peers have which pages through fetch outcomes:
+1. **Page hints** -- on hit, record the peer for that page + all B-tree siblings
+2. **Leader routing** -- if a leader peer is set, route all unhinted pages there
+3. **[EWMA](https://en.wikipedia.org/wiki/Exponential_smoothing) hit rate** -- peers with >30% hit rate get routed to for unhinted pages
+4. **Exploration** -- 10% of unhinted requests go to random peers for discovery
+
+## References
+
+- [SQLite Database File Format](https://www.sqlite.org/fileformat2.html) -- page layout, B-tree structure, interior page format
+- [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) (Dean & Barroso, 2013) -- hedged requests for tail latency
+- [Leap: Prefetcher for Distributed File Systems](https://www.usenix.org/conference/atc20/presentation/maruf) (Maruf et al., USENIX ATC '20) -- pattern classification for prefetching
+
+## Dependencies
+
+Standard library only. Zero external dependencies.
+
+## License
+
+Apache 2.0
