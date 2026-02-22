@@ -116,7 +116,7 @@ func (p *Prefetcher) GetPage(ctx context.Context, pageNo int64) ([]byte, error) 
 	r := p.readahead
 	p.mu.Unlock()
 	if r != nil {
-		r.OnFault(pageNo)
+		r.OnPageAccess(pageNo)
 	}
 	return p.getPageInternal(ctx, pageNo, false)
 }
@@ -198,6 +198,7 @@ func (p *Prefetcher) NotifyPageRead(pageNo int64, data []byte) {
 	r := p.readahead
 	p.mu.Unlock()
 	if r != nil {
+		r.OnPageAccess(pageNo)
 		r.OnFetchComplete(pageNo, data)
 	}
 }

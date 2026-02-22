@@ -40,7 +40,7 @@ func TestPeerRouter_RecordMiss(t *testing.T) {
 func TestPeerRouter_SiblingExpansion(t *testing.T) {
 	// Build a readahead engine with a btreeTracker that has an interior page.
 	pf := New(&nullSource{}, &nullCache{})
-	re := NewReadaheadEngine(pf, nil, &nullCache{}, nil, ReadaheadConfig{})
+	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
 
 	// Feed an interior page: 1-based [11, 21, 31, 41, 51] → 0-based [10, 20, 30, 40, 50].
 	children := []uint32{11, 21, 31, 41, 51}
@@ -270,7 +270,7 @@ type routingMetrics struct {
 func runWithPeerRouter(sc routingScenario) routingMetrics {
 	// Build readahead engine with btree structure.
 	pf := New(&nullSource{}, &nullCache{})
-	re := NewReadaheadEngine(pf, nil, &nullCache{}, nil, ReadaheadConfig{})
+	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
 
 	// Feed interior pages.
 	for interiorPgno, children := range sc.btreeStructure {
@@ -622,7 +622,7 @@ func TestRoutingScenario_BtreeAmplification(t *testing.T) {
 	// Verify by checking subsequent pages route correctly.
 	// Build readahead engine with structure.
 	pf := New(&nullSource{}, &nullCache{})
-	re := NewReadaheadEngine(pf, nil, &nullCache{}, nil, ReadaheadConfig{})
+	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
 	for interiorPgno, children := range btree {
 		oneBased := make([]uint32, len(children))
 		for i, c := range children {
@@ -659,7 +659,7 @@ func TestRoutingScenario_PeerDeparture(t *testing.T) {
 	}
 
 	pf := New(&nullSource{}, &nullCache{})
-	re := NewReadaheadEngine(pf, nil, &nullCache{}, nil, ReadaheadConfig{})
+	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
 	router := NewPeerRouter(re)
 
 	// Build up knowledge: 20 hits from A.
@@ -732,7 +732,7 @@ func TestRoutingScenario_LeaderAwareColdStart(t *testing.T) {
 
 	// With leader hint: build a custom simulation.
 	pf := New(&nullSource{}, &nullCache{})
-	re := NewReadaheadEngine(pf, nil, &nullCache{}, nil, ReadaheadConfig{})
+	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
 	router := NewPeerRouter(re)
 	router.SetLeader("leader")
 

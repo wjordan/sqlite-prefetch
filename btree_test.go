@@ -43,7 +43,7 @@ func TestParseInteriorTablePage_Basic(t *testing.T) {
 	children := []uint32{10, 20, 30, 40, 50}
 	page := buildInteriorTablePage(4096, children)
 
-	got, err := parseInteriorTablePage(page, 2)
+	got, err := parseInteriorPage(page, 2)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestParseInteriorTablePage_Page1Offset(t *testing.T) {
 	binary.BigEndian.PutUint32(page1[cellOff:cellOff+4], 5)                 // child = 5
 	page1[cellOff+4] = 1                                                    // varint rowid
 
-	got, err := parseInteriorTablePage(page1, 1)
+	got, err := parseInteriorPage(page1, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestParseInteriorTablePage_SingleCell(t *testing.T) {
 	children := []uint32{7, 99}
 	page := buildInteriorTablePage(4096, children)
 
-	got, err := parseInteriorTablePage(page, 2)
+	got, err := parseInteriorPage(page, 2)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -98,14 +98,14 @@ func TestParseInteriorTablePage_NotInterior(t *testing.T) {
 	page := make([]byte, 4096)
 	page[0] = 0x0D // leaf table page, not interior
 
-	_, err := parseInteriorTablePage(page, 2)
+	_, err := parseInteriorPage(page, 2)
 	if err == nil {
 		t.Fatal("expected error for non-interior page")
 	}
 }
 
 func TestParseInteriorTablePage_TooSmall(t *testing.T) {
-	_, err := parseInteriorTablePage(make([]byte, 10), 2)
+	_, err := parseInteriorPage(make([]byte, 10), 2)
 	if err == nil {
 		t.Fatal("expected error for undersized page")
 	}
@@ -116,7 +116,7 @@ func TestParseInteriorTablePage_ZeroCells(t *testing.T) {
 	page[0] = 0x05
 	// cellCount = 0 at bytes 3-4 (already zero)
 
-	_, err := parseInteriorTablePage(page, 2)
+	_, err := parseInteriorPage(page, 2)
 	if err == nil {
 		t.Fatal("expected error for zero cells")
 	}
@@ -130,9 +130,209 @@ func TestParseInteriorTablePage_CellOffsetOutOfBounds(t *testing.T) {
 	// Cell offset pointing beyond page.
 	binary.BigEndian.PutUint16(page[12:14], 4095)
 
-	_, err := parseInteriorTablePage(page, 2)
+	_, err := parseInteriorPage(page, 2)
 	if err == nil {
 		t.Fatal("expected error for out-of-bounds cell offset")
+	}
+}
+
+func TestParseInteriorPage_IndexPage(t *testing.T) {
+	// Interior index pages have flag 0x02 with same child pointer layout.
+	children := []uint32{10, 20, 30, 40, 50}
+	page := buildInteriorTablePage(4096, children)
+	page[0] = 0x02 // change flag to interior index
+
+	got, err := parseInteriorPage(page, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != len(children) {
+		t.Fatalf("got %d children, want %d", len(got), len(children))
+	}
+	for i, c := range children {
+		if got[i] != c {
+			t.Errorf("child[%d] = %d, want %d", i, got[i], c)
+		}
+	}
+}
+
+func TestBtreeTracker_IndexPageParsed(t *testing.T) {
+	bt := newBtreeTracker(1024)
+	// Build interior index page with 1-based children [11, 21, 31] → 0-based [10, 20, 30].
+	children := []uint32{11, 21, 31}
+	page := buildInteriorTablePage(4096, children)
+	page[0] = 0x02 // interior index
+
+	bt.OnFetchComplete(5, page)
+
+	// Should predict siblings from the index page.
+	pages, result := bt.Predict(10)
+	if result != PredictOK {
+		t.Fatal("expected prediction for index child 10")
+	}
+	want := []uint32{20, 30}
+	if len(pages) != len(want) {
+		t.Fatalf("got %v, want %v", pages, want)
+	}
+	for i, p := range want {
+		if pages[i] != p {
+			t.Errorf("pages[%d] = %d, want %d", i, pages[i], p)
+		}
+	}
+}
+
+func TestReadVarint(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []byte
+		want  uint64
+		wantN int
+	}{
+		{"zero", []byte{0x00}, 0, 1},
+		{"one byte small", []byte{0x17}, 23, 1},
+		{"one byte max", []byte{0x7F}, 127, 1},
+		{"two bytes", []byte{0x81, 0x00}, 128, 2},
+		{"two bytes 300", []byte{0x82, 0x2C}, 300, 2},
+		{"empty", []byte{}, 0, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			val, n := readVarint(tt.input)
+			if val != tt.want || n != tt.wantN {
+				t.Errorf("readVarint(%v) = (%d, %d), want (%d, %d)", tt.input, val, n, tt.want, tt.wantN)
+			}
+		})
+	}
+}
+
+// buildLeafTablePage constructs a leaf table page (flag 0x0D) with the given cells.
+// Each cell has a specified payload size. If payloadSize exceeds maxLocal,
+// the cell includes an overflow page number.
+func buildLeafTablePage(pageSize int, cells []leafCell) []byte {
+	page := make([]byte, pageSize)
+	page[0] = 0x0D // leaf table b-tree
+	cellCount := len(cells)
+	binary.BigEndian.PutUint16(page[3:5], uint16(cellCount))
+
+	// Leaf page header is 8 bytes. Cell pointer array follows.
+	ptrArrayStart := 8
+	cellBodyStart := pageSize
+
+	for i, cell := range cells {
+		// Encode payload size varint.
+		payloadVarint := encodeVarint(uint64(cell.payloadSize))
+		// Encode rowid varint.
+		rowidVarint := encodeVarint(uint64(cell.rowid))
+
+		usable := pageSize
+		maxLocal := (usable-35)*64/255 - 23
+		minLocal := (usable-12)*32/255 - 23
+
+		var localSize int
+		var ovflPgno uint32
+		if cell.payloadSize > maxLocal {
+			localSize = minLocal + (cell.payloadSize-minLocal)%(usable-4)
+			if localSize > maxLocal {
+				localSize = minLocal
+			}
+			ovflPgno = cell.overflowPgno
+		} else {
+			localSize = cell.payloadSize
+		}
+
+		cellSize := len(payloadVarint) + len(rowidVarint) + localSize
+		if ovflPgno > 0 {
+			cellSize += 4
+		}
+		cellBodyStart -= cellSize
+
+		// Cell pointer.
+		binary.BigEndian.PutUint16(page[ptrArrayStart+i*2:ptrArrayStart+i*2+2], uint16(cellBodyStart))
+
+		// Cell body.
+		off := cellBodyStart
+		copy(page[off:], payloadVarint)
+		off += len(payloadVarint)
+		copy(page[off:], rowidVarint)
+		off += len(rowidVarint)
+		// Fill local payload with dummy data.
+		for j := 0; j < localSize; j++ {
+			page[off+j] = 0xAA
+		}
+		off += localSize
+		if ovflPgno > 0 {
+			binary.BigEndian.PutUint32(page[off:off+4], ovflPgno)
+		}
+	}
+
+	return page
+}
+
+type leafCell struct {
+	payloadSize  int
+	rowid        int
+	overflowPgno uint32 // 1-based; 0 means no overflow
+}
+
+func encodeVarint(v uint64) []byte {
+	if v <= 127 {
+		return []byte{byte(v)}
+	}
+	var buf [9]byte
+	n := 8
+	buf[n] = byte(v & 0x7F)
+	v >>= 7
+	for v > 0 {
+		n--
+		buf[n] = byte(v&0x7F) | 0x80
+		v >>= 7
+	}
+	return buf[n:]
+}
+
+func TestParseLeafTableOverflows_NoOverflow(t *testing.T) {
+	// Small payload that fits entirely on page.
+	cells := []leafCell{
+		{payloadSize: 100, rowid: 1},
+		{payloadSize: 50, rowid: 2},
+	}
+	page := buildLeafTablePage(4096, cells)
+
+	overflows := parseLeafTableOverflows(page, 2)
+	if len(overflows) != 0 {
+		t.Fatalf("expected no overflows, got %v", overflows)
+	}
+}
+
+func TestParseLeafTableOverflows_WithOverflow(t *testing.T) {
+	// maxLocal for 4096-byte page: (4096-35)*64/255 - 23 ≈ 995
+	// Payload of 5000 bytes requires overflow.
+	cells := []leafCell{
+		{payloadSize: 100, rowid: 1},                       // no overflow
+		{payloadSize: 5000, rowid: 2, overflowPgno: 42},    // overflow to page 42
+		{payloadSize: 10000, rowid: 3, overflowPgno: 100},  // overflow to page 100
+	}
+	page := buildLeafTablePage(4096, cells)
+
+	overflows := parseLeafTableOverflows(page, 2)
+	if len(overflows) != 2 {
+		t.Fatalf("expected 2 overflows, got %v", overflows)
+	}
+	if overflows[0] != 42 {
+		t.Errorf("overflow[0] = %d, want 42", overflows[0])
+	}
+	if overflows[1] != 100 {
+		t.Errorf("overflow[1] = %d, want 100", overflows[1])
+	}
+}
+
+func TestParseLeafTableOverflows_NotLeafTable(t *testing.T) {
+	page := make([]byte, 4096)
+	page[0] = 0x05 // interior table, not leaf
+
+	overflows := parseLeafTableOverflows(page, 2)
+	if overflows != nil {
+		t.Fatalf("expected nil for non-leaf page, got %v", overflows)
 	}
 }
 

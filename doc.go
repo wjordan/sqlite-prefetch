@@ -15,12 +15,15 @@
 //     readahead share a single fetch.
 //   - [Scheduler] — Multi-source cost-model ranking (estimatedTime = latency +
 //     bytes/bandwidth) with hedged requests per Google's "The Tail at Scale".
-//   - [ReadaheadEngine] — Access pattern classification (sequential/stride/random
-//     per Leap, USENIX ATC '20), AIMD window sizing, latency-adaptive depth,
-//     waste tracking with feedback loop.
-//   - btreeTracker — Parses SQLite interior pages (flag 0x05) to predict exactly
-//     which leaf pages will be needed next. Multi-level lookahead prefetches the
-//     next interior sibling before it is needed.
+//   - [ReadaheadEngine] — Scan detection via two-consecutive-sibling accesses
+//     under the same B-tree parent (analogous to Linux kernel ondemand_readahead).
+//     Point selects touch a single child and trigger no prefetch; scans touch
+//     consecutive siblings and trigger prefetch of all remaining siblings.
+//   - btreeTracker — Parses SQLite interior pages (flags 0x05 and 0x02) to predict
+//     exactly which leaf pages will be needed next. Multi-level lookahead prefetches
+//     the next interior sibling before it is needed.
+//   - Overflow prefetcher — Parses leaf table pages (0x0D) to find overflow page
+//     chains and cascades prefetches through the linked list.
 //   - [PeerRouter] — Reactive peer routing with EWMA hit rates and B-tree
 //     sibling amplification.
 //
@@ -37,8 +40,7 @@
 //	p.SetScheduler(sched)
 //
 //	// Optional: add readahead with B-tree awareness.
-//	wt := prefetch.NewWasteTracker()
-//	re := prefetch.NewReadaheadEngine(p, sched, cache, wt, prefetch.ReadaheadConfig{})
+//	re := prefetch.NewReadaheadEngine(p, cache, prefetch.ReadaheadConfig{})
 //	p.SetReadahead(re)
 //
 //	// Fetch pages — readahead and deduplication happen automatically.

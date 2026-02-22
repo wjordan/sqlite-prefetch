@@ -3,249 +3,15 @@ package prefetch
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// --- Pattern Tracker Tests ---
-
-func TestPatternTracker_Sequential(t *testing.T) {
-	var pt patternTracker
-	for i := int64(10); i <= 17; i++ {
-		pt.Record(i)
-	}
-	pat, stride := pt.Classify()
-	if pat != PatternSequential {
-		t.Fatalf("expected Sequential, got %v", pat)
-	}
-	if stride != 1 {
-		t.Fatalf("expected stride 1, got %d", stride)
-	}
-}
-
-func TestPatternTracker_Stride(t *testing.T) {
-	var pt patternTracker
-	for i := 0; i < 6; i++ {
-		pt.Record(int64(100 + i*3))
-	}
-	pat, stride := pt.Classify()
-	if pat != PatternStride {
-		t.Fatalf("expected Stride, got %v", pat)
-	}
-	if stride != 3 {
-		t.Fatalf("expected stride 3, got %d", stride)
-	}
-}
-
-func TestPatternTracker_NegativeStride(t *testing.T) {
-	var pt patternTracker
-	for i := 0; i < 5; i++ {
-		pt.Record(int64(100 - i*2))
-	}
-	pat, stride := pt.Classify()
-	if pat != PatternStride {
-		t.Fatalf("expected Stride, got %v", pat)
-	}
-	if stride != -2 {
-		t.Fatalf("expected stride -2, got %d", stride)
-	}
-}
-
-func TestPatternTracker_Random(t *testing.T) {
-	var pt patternTracker
-	pages := []int64{5, 100, 3, 99, 7, 200}
-	for _, p := range pages {
-		pt.Record(p)
-	}
-	pat, _ := pt.Classify()
-	if pat != PatternRandom {
-		t.Fatalf("expected Random, got %v", pat)
-	}
-}
-
-func TestPatternTracker_InsufficientEntries(t *testing.T) {
-	var pt patternTracker
-	pt.Record(1)
-	pt.Record(2)
-	pat, _ := pt.Classify()
-	if pat != PatternRandom {
-		t.Fatalf("expected Random with <3 entries, got %v", pat)
-	}
-}
-
-func TestPatternTracker_Reset(t *testing.T) {
-	var pt patternTracker
-	for i := 0; i < 5; i++ {
-		pt.Record(int64(i))
-	}
-	pt.Reset()
-	if pt.count != 0 || pt.pos != 0 {
-		t.Fatal("Reset did not clear state")
-	}
-	pat, _ := pt.Classify()
-	if pat != PatternRandom {
-		t.Fatalf("expected Random after reset, got %v", pat)
-	}
-}
-
-func TestPatternTracker_MixedThenSequential(t *testing.T) {
-	var pt patternTracker
-	// Random entries fill the buffer...
-	pt.Record(100)
-	pt.Record(5)
-	pt.Record(200)
-	// ...then sequential entries dominate (ring buffer wraps)
-	for i := int64(10); i <= 17; i++ {
-		pt.Record(i)
-	}
-	pat, stride := pt.Classify()
-	if pat != PatternSequential {
-		t.Fatalf("expected Sequential after wrap, got %v", pat)
-	}
-	if stride != 1 {
-		t.Fatalf("expected stride 1, got %d", stride)
-	}
-}
-
-// --- AIMD Window Tests ---
-
-func TestAIMDWindow_GrowShrink(t *testing.T) {
-	w := newAIMDWindow(16, 4, 256)
-
-	w.Grow()
-	if w.size != 32 {
-		t.Fatalf("after Grow: expected 32, got %d", w.size)
-	}
-	w.Shrink()
-	if w.size != 16 {
-		t.Fatalf("after Shrink: expected 16, got %d", w.size)
-	}
-}
-
-func TestAIMDWindow_MaxBound(t *testing.T) {
-	w := newAIMDWindow(128, 4, 256)
-	w.Grow() // 256
-	w.Grow() // still 256 (capped)
-	if w.size != 256 {
-		t.Fatalf("expected 256 (max), got %d", w.size)
-	}
-}
-
-func TestAIMDWindow_MinBound(t *testing.T) {
-	w := newAIMDWindow(8, 4, 256)
-	w.Shrink() // 4
-	w.Shrink() // still 4 (floored)
-	if w.size != 4 {
-		t.Fatalf("expected 4 (min), got %d", w.size)
-	}
-}
-
-func TestAIMDWindow_DepthLimit(t *testing.T) {
-	w := newAIMDWindow(64, 4, 256)
-	if s := w.Size(10); s != 10 {
-		t.Fatalf("expected 10 (depth-limited), got %d", s)
-	}
-	if s := w.Size(100); s != 64 {
-		t.Fatalf("expected 64 (window-limited), got %d", s)
-	}
-	if s := w.Size(0); s != 64 {
-		t.Fatalf("expected 64 (no depth limit), got %d", s)
-	}
-}
-
-func TestAIMDWindow_SetMaxSize(t *testing.T) {
-	w := newAIMDWindow(64, 4, 256)
-	w.SetMaxSize(32)
-	if w.maxSize != 32 {
-		t.Fatalf("expected maxSize 32, got %d", w.maxSize)
-	}
-	if w.size != 32 {
-		t.Fatalf("expected size capped to 32, got %d", w.size)
-	}
-	// Can't set below min.
-	w.SetMaxSize(2)
-	if w.maxSize != 4 {
-		t.Fatalf("expected maxSize floored to 4, got %d", w.maxSize)
-	}
-}
-
-func TestAIMDWindow_Reset(t *testing.T) {
-	w := newAIMDWindow(16, 4, 256)
-	w.Grow()
-	w.Grow()
-	w.Reset()
-	if w.size != 16 {
-		t.Fatalf("after Reset: expected 16, got %d", w.size)
-	}
-}
-
-// --- Inter-Fault Tracker Tests ---
-
-func TestInterFaultTracker_Interval(t *testing.T) {
-	ift := newInterFaultTracker()
-	base := time.Now()
-
-	ift.Record(base)
-	if ift.Interval() != 0 {
-		t.Fatal("expected 0 interval after first record")
-	}
-
-	ift.Record(base.Add(10 * time.Millisecond))
-	ift.Record(base.Add(20 * time.Millisecond))
-	ift.Record(base.Add(30 * time.Millisecond))
-
-	interval := ift.Interval()
-	if interval < 8*time.Millisecond || interval > 12*time.Millisecond {
-		t.Fatalf("expected ~10ms, got %s", interval)
-	}
-}
-
-func TestInterFaultTracker_Reset(t *testing.T) {
-	ift := newInterFaultTracker()
-	ift.Record(time.Now())
-	ift.Record(time.Now().Add(10 * time.Millisecond))
-	ift.Reset()
-	if ift.Interval() != 0 {
-		t.Fatal("expected 0 after reset")
-	}
-}
-
-// --- Waste Tracker Tests ---
-
-func TestWasteTracker_Ratio(t *testing.T) {
-	wt := NewWasteTracker()
-	if r := wt.WasteRatio(); r != 0 {
-		t.Fatalf("expected 0 ratio with no data, got %f", r)
-	}
-
-	// 10 prefetched, 3 wasted (evicted without access)
-	for i := 0; i < 10; i++ {
-		wt.OnPrefetched()
-	}
-	for i := 0; i < 3; i++ {
-		wt.OnEviction(true, false) // prefetched, not accessed = waste
-	}
-	wt.OnEviction(true, true)   // prefetched, accessed = not waste
-	wt.OnEviction(false, false) // not prefetched = not waste
-
-	ratio := wt.WasteRatio()
-	if ratio < 0.29 || ratio > 0.31 {
-		t.Fatalf("expected ~0.3, got %f", ratio)
-	}
-}
-
-func TestWasteTracker_ZeroPrefetched(t *testing.T) {
-	wt := NewWasteTracker()
-	wt.OnEviction(true, false) // shouldn't panic
-	if r := wt.WasteRatio(); r != 0 {
-		t.Fatalf("expected 0 with no prefetched, got %f", r)
-	}
-}
-
 // --- ReadaheadEngine Tests ---
 
-// countingSource wraps a mockSource and counts getPageInternal calls.
+// readaheadTestSource wraps a map and counts fetches.
 type readaheadTestSource struct {
 	data    map[int64][]byte
 	fetches atomic.Int64
@@ -269,36 +35,51 @@ func (s *readaheadTestSource) GetPage(_ context.Context, pageNo int64) ([]byte, 
 	return make([]byte, 4096), nil
 }
 
-func TestReadaheadEngine_SequentialTriggersPrefetch(t *testing.T) {
+func TestReadaheadEngine_BtreeWithIndexPages(t *testing.T) {
 	src := newReadaheadTestSource(200)
 	cache := newMockCache()
 	p := New(src, cache)
-	wt := NewWasteTracker()
-	re := NewReadaheadEngine(p, nil, cache, wt, ReadaheadConfig{
-		InitWindow: 8, MinWindow: 2, MaxWindow: 32, Workers: 4,
-	})
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
 	p.SetReadahead(re)
 
-	// Simulate sequential page faults.
-	for i := int64(0); i < 10; i++ {
+	// Build interior index page (flag 0x02) with children 100-149.
+	indexChildren := make([]uint32, 50)
+	for i := range indexChildren {
+		indexChildren[i] = uint32(101 + i) // 1-based
+	}
+	interiorPage := buildInteriorTablePage(4096, indexChildren)
+	interiorPage[0] = 0x02 // interior index
+	src.data[5] = interiorPage
+
+	// Fetch interior index page — should be parsed by btree tracker.
+	_, err := p.GetPage(context.Background(), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	// Access two consecutive children to trigger scan detection.
+	for i := int64(100); i < 103; i++ {
 		_, err := p.GetPage(context.Background(), i)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	// Give readahead goroutines time to complete.
 	time.Sleep(50 * time.Millisecond)
 
-	// Pages beyond 10 should have been prefetched into cache.
+	// Btree should have predicted and prefetched remaining siblings.
 	prefetched := 0
-	for i := int64(10); i < 30; i++ {
-		if _, ok := cache.Get(i); ok {
+	for i := int64(103); i < 120; i++ {
+		if cache.Has(i) {
 			prefetched++
 		}
 	}
 	if prefetched == 0 {
-		t.Fatal("expected some pages to be prefetched ahead of sequential access")
+		t.Fatal("expected btree to prefetch index children")
+	}
+	stats := re.Stats()
+	if stats.BtreeHits == 0 {
+		t.Fatal("expected btree hits for index page children")
 	}
 }
 
@@ -306,13 +87,10 @@ func TestReadaheadEngine_RandomNoTrigger(t *testing.T) {
 	src := newReadaheadTestSource(200)
 	cache := newMockCache()
 	p := New(src, cache)
-	wt := NewWasteTracker()
-	re := NewReadaheadEngine(p, nil, cache, wt, ReadaheadConfig{
-		InitWindow: 8, MinWindow: 2, MaxWindow: 32, Workers: 4,
-	})
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
 	p.SetReadahead(re)
 
-	// Simulate random page faults.
+	// Simulate random page faults (not known btree children).
 	randoms := []int64{5, 100, 3, 150, 42, 199, 1, 88, 77, 12}
 	for _, pg := range randoms {
 		_, err := p.GetPage(context.Background(), pg)
@@ -324,93 +102,11 @@ func TestReadaheadEngine_RandomNoTrigger(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	// Should NOT have prefetched much beyond the actual requests.
+	cache.mu.Lock()
 	totalCached := len(cache.pages)
+	cache.mu.Unlock()
 	if totalCached > len(randoms)+2 {
 		t.Fatalf("expected ~%d cached pages (random, no prefetch), got %d", len(randoms), totalCached)
-	}
-}
-
-func TestReadaheadEngine_StrideTriggersPrefetch(t *testing.T) {
-	src := newReadaheadTestSource(500)
-	cache := newMockCache()
-	p := New(src, cache)
-	wt := NewWasteTracker()
-	re := NewReadaheadEngine(p, nil, cache, wt, ReadaheadConfig{
-		InitWindow: 8, MinWindow: 2, MaxWindow: 32, Workers: 4,
-	})
-	p.SetReadahead(re)
-
-	// Simulate stride-3 access.
-	for i := 0; i < 10; i++ {
-		_, err := p.GetPage(context.Background(), int64(i*3))
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	time.Sleep(50 * time.Millisecond)
-
-	// Pages at stride-3 beyond 27 should be prefetched.
-	prefetched := 0
-	for i := 10; i < 20; i++ {
-		if _, ok := cache.Get(int64(i * 3)); ok {
-			prefetched++
-		}
-	}
-	if prefetched == 0 {
-		t.Fatal("expected some pages to be prefetched at stride-3")
-	}
-}
-
-func TestReadaheadEngine_WindowGrowsOnConfirmation(t *testing.T) {
-	re := &ReadaheadEngine{
-		window:             newAIMDWindow(8, 2, 64),
-		faultTracker:       newInterFaultTracker(),
-		wasteTracker:       NewWasteTracker(),
-		workerSem:          make(chan struct{}, 4),
-		cfg:                ReadaheadConfig{InitWindow: 8, MinWindow: 2, MaxWindow: 64, WasteHigh: 0.3, WasteLow: 0.1},
-		cfgMax:             64,
-		lastPrefetchedSet:  map[uint32]bool{10: true, 11: true, 12: true, 13: true},
-		lastPrefetchActive: true,
-	}
-
-	initial := re.window.size
-
-	// Fault on page in the prefetch set → should grow.
-	re.mu.Lock()
-	if re.inPrefetchedSet(12) {
-		re.window.Grow()
-	}
-	re.mu.Unlock()
-
-	if re.window.size <= initial {
-		t.Fatalf("expected window to grow from %d, got %d", initial, re.window.size)
-	}
-}
-
-func TestReadaheadEngine_WindowShrinksOnMiss(t *testing.T) {
-	re := &ReadaheadEngine{
-		window:             newAIMDWindow(16, 2, 64),
-		faultTracker:       newInterFaultTracker(),
-		wasteTracker:       NewWasteTracker(),
-		workerSem:          make(chan struct{}, 4),
-		cfg:                ReadaheadConfig{InitWindow: 16, MinWindow: 2, MaxWindow: 64, WasteHigh: 0.3, WasteLow: 0.1},
-		cfgMax:             64,
-		lastPrefetchedSet:  map[uint32]bool{10: true, 11: true, 12: true},
-		lastPrefetchActive: true,
-	}
-
-	initial := re.window.size
-
-	// Fault on page NOT in the prefetch set → should shrink.
-	re.mu.Lock()
-	if !re.inPrefetchedSet(100) {
-		re.window.Shrink()
-	}
-	re.mu.Unlock()
-
-	if re.window.size >= initial {
-		t.Fatalf("expected window to shrink from %d, got %d", initial, re.window.size)
 	}
 }
 
@@ -418,28 +114,23 @@ func TestReadaheadEngine_Reset(t *testing.T) {
 	src := newReadaheadTestSource(100)
 	cache := newMockCache()
 	p := New(src, cache)
-	wt := NewWasteTracker()
-	re := NewReadaheadEngine(p, nil, cache, wt, ReadaheadConfig{
-		InitWindow: 16, MinWindow: 4, MaxWindow: 64, Workers: 4,
-	})
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
 
 	// Build up some state.
-	re.pattern.Record(1)
-	re.pattern.Record(2)
-	re.pattern.Record(3)
-	re.lastPrefetchedSet = map[uint32]bool{4: true, 5: true}
-	re.lastPrefetchActive = true
+	re.scanParent = 42
+	re.scanIdx = 3
+	re.overflowSet[99] = true
 
 	re.Reset()
 
-	if re.pattern.count != 0 {
-		t.Fatal("pattern not reset")
+	if re.scanParent != 0 {
+		t.Fatalf("scanParent not reset: %d", re.scanParent)
 	}
-	if re.lastPrefetchActive {
-		t.Fatal("lastPrefetchActive not reset")
+	if re.scanIdx != -1 {
+		t.Fatalf("scanIdx not reset: %d", re.scanIdx)
 	}
-	if re.window.size != 16 {
-		t.Fatalf("window not reset to init: %d", re.window.size)
+	if len(re.overflowSet) != 0 {
+		t.Fatal("overflowSet not reset")
 	}
 }
 
@@ -447,12 +138,9 @@ func TestReadaheadEngine_BoundedWorkers(t *testing.T) {
 	src := newReadaheadTestSource(100)
 	cache := newMockCache()
 	p := New(src, cache)
-	wt := NewWasteTracker()
 
 	workers := 2
-	re := NewReadaheadEngine(p, nil, cache, wt, ReadaheadConfig{
-		InitWindow: 8, MinWindow: 2, MaxWindow: 32, Workers: workers,
-	})
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: workers})
 
 	// Worker semaphore should have capacity = workers.
 	if cap(re.workerSem) != workers {
@@ -460,60 +148,45 @@ func TestReadaheadEngine_BoundedWorkers(t *testing.T) {
 	}
 }
 
-func TestPrefetcher_GetPageTriggersOnFault(t *testing.T) {
+func TestPrefetcher_GetPageTriggersOnPageAccess(t *testing.T) {
 	src := newReadaheadTestSource(100)
 	cache := newMockCache()
 	p := New(src, cache)
 
-	var faults atomic.Int64
-	re := &testReadaheadEngine{onFault: func(pageNo int64) { faults.Add(1) }}
-	p.readahead = &ReadaheadEngine{} // placeholder; we override OnFault via wrapper
-
-	// Use a real engine but check OnFault is called.
-	wt := NewWasteTracker()
-	realRe := NewReadaheadEngine(p, nil, cache, wt, ReadaheadConfig{
-		InitWindow: 4, MinWindow: 2, MaxWindow: 16, Workers: 2,
-	})
-	p.SetReadahead(realRe)
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 2})
+	p.SetReadahead(re)
 
 	_, err := p.GetPage(context.Background(), 5)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = re // suppress unused
 
-	// OnFault was called inside GetPage (we verify by checking the pattern tracker
-	// has recorded the page).
-	realRe.mu.Lock()
-	count := realRe.pattern.count
-	realRe.mu.Unlock()
-	if count == 0 {
-		t.Fatal("expected OnFault to record the page in pattern tracker")
+	// Page 5 is not a known btree child, so OnPageAccess should reset
+	// scan state without triggering prefetch.
+	stats := re.Stats()
+	if stats.BtreeHits != 0 {
+		t.Fatal("expected no btree hits for unknown page")
 	}
 }
 
-func TestPrefetcher_InternalSkipsOnFault(t *testing.T) {
+func TestPrefetcher_InternalSkipsOnPageAccess(t *testing.T) {
 	src := newReadaheadTestSource(100)
 	cache := newMockCache()
 	p := New(src, cache)
 
-	wt := NewWasteTracker()
-	re := NewReadaheadEngine(p, nil, cache, wt, ReadaheadConfig{
-		InitWindow: 4, MinWindow: 2, MaxWindow: 16, Workers: 2,
-	})
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 2})
 	p.SetReadahead(re)
 
-	// getPageInternal should NOT trigger OnFault.
+	// getPageInternal should NOT trigger OnPageAccess.
 	_, err := p.getPageInternal(context.Background(), 5, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	re.mu.Lock()
-	count := re.pattern.count
-	re.mu.Unlock()
-	if count != 0 {
-		t.Fatal("expected getPageInternal to NOT trigger OnFault")
+	// No OnPageAccess called → btree hits should be 0, scan state untouched.
+	stats := re.Stats()
+	if stats.BtreeHits != 0 {
+		t.Fatal("expected getPageInternal to NOT trigger OnPageAccess")
 	}
 
 	// Verify it was cached as prefetched.
@@ -527,14 +200,11 @@ type testReadaheadEngine struct {
 	onFault func(pageNo int64)
 }
 
-func TestReadaheadEngine_BtreeOverridesStride(t *testing.T) {
+func TestReadaheadEngine_BtreePrefetchesChildren(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
 	p := New(src, cache)
-	wt := NewWasteTracker()
-	re := NewReadaheadEngine(p, nil, cache, wt, ReadaheadConfig{
-		InitWindow: 8, MinWindow: 2, MaxWindow: 32, Workers: 4,
-	})
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
 	p.SetReadahead(re)
 
 	// Feed an interior page to the B-tree tracker. Page data contains 1-based
@@ -543,51 +213,24 @@ func TestReadaheadEngine_BtreeOverridesStride(t *testing.T) {
 	interiorPage := buildInteriorTablePage(4096, btreeChildren)
 	re.btree.OnFetchComplete(2, interiorPage)
 
-	// Fault on 0-based page 42 → should prefetch [17, 203, 8, 156], NOT stride-based.
+	// Access two consecutive children (42 then 17 = children[0] then children[1])
+	// to trigger scan detection.
 	_, err := p.GetPage(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.GetPage(context.Background(), 17)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Verify B-tree children were prefetched.
-	for _, child := range []int64{17, 203, 8, 156} {
+	// Verify remaining B-tree children were prefetched: [203, 8, 156].
+	for _, child := range []int64{203, 8, 156} {
 		if !cache.Has(child) {
 			t.Errorf("expected B-tree child %d to be prefetched", child)
 		}
-	}
-}
-
-func TestReadaheadEngine_BtreeFallbackToStride(t *testing.T) {
-	src := newReadaheadTestSource(200)
-	cache := newMockCache()
-	p := New(src, cache)
-	wt := NewWasteTracker()
-	re := NewReadaheadEngine(p, nil, cache, wt, ReadaheadConfig{
-		InitWindow: 8, MinWindow: 2, MaxWindow: 32, Workers: 4,
-	})
-	p.SetReadahead(re)
-
-	// No B-tree data fed — should fall back to P3 stride detection.
-	for i := int64(0); i < 10; i++ {
-		_, err := p.GetPage(context.Background(), i)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	time.Sleep(50 * time.Millisecond)
-
-	// Sequential pages beyond 10 should have been prefetched (P3 stride).
-	prefetched := 0
-	for i := int64(10); i < 20; i++ {
-		if cache.Has(i) {
-			prefetched++
-		}
-	}
-	if prefetched == 0 {
-		t.Fatal("expected P3 stride prefetching as fallback")
 	}
 }
 
@@ -595,10 +238,7 @@ func TestReadaheadEngine_BtreeRandomPattern(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
 	p := New(src, cache)
-	wt := NewWasteTracker()
-	re := NewReadaheadEngine(p, nil, cache, wt, ReadaheadConfig{
-		InitWindow: 16, MinWindow: 2, MaxWindow: 64, Workers: 4,
-	})
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
 	p.SetReadahead(re)
 
 	// Feed an interior page with scattered children. Page data is 1-based;
@@ -607,8 +247,8 @@ func TestReadaheadEngine_BtreeRandomPattern(t *testing.T) {
 	interiorPage := buildInteriorTablePage(4096, btreeChildren)
 	re.btree.OnFetchComplete(2, interiorPage)
 
-	// Access children in order — these look "random" to P3's pattern tracker
-	// (deltas: -350, +250, -150, +100, -150) but B-tree knows exactly.
+	// Access two consecutive children (400 then 50 = children[0] then children[1])
+	// to trigger scan detection, then continue.
 	for _, pg := range []int64{400, 50, 300} {
 		_, err := p.GetPage(context.Background(), pg)
 		if err != nil {
@@ -618,10 +258,317 @@ func TestReadaheadEngine_BtreeRandomPattern(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// B-tree should have prefetched remaining children after 300: [150, 250, 100].
+	// B-tree should have prefetched remaining children after 50: [300, 150, 250, 100].
 	for _, child := range []int64{150, 250, 100} {
 		if !cache.Has(child) {
 			t.Errorf("expected B-tree child %d to be prefetched despite random-looking pattern", child)
 		}
+	}
+}
+
+// --- Scan Detection Tests ---
+
+func TestReadaheadEngine_ScanDetectsConsecutiveSiblings(t *testing.T) {
+	src := newReadaheadTestSource(500)
+	cache := newMockCache()
+	p := New(src, cache)
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
+	p.SetReadahead(re)
+
+	// Interior page with children [10, 20, 30, 40, 50] (0-based).
+	btreeChildren := []uint32{11, 21, 31, 41, 51} // 1-based
+	interiorPage := buildInteriorTablePage(4096, btreeChildren)
+	re.btree.OnFetchComplete(2, interiorPage)
+
+	// Access child[0] then child[1] → scan detected, prefetch remaining.
+	_, err := p.GetPage(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.GetPage(context.Background(), 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Remaining siblings [30, 40, 50] should be prefetched.
+	for _, child := range []int64{30, 40, 50} {
+		if !cache.Has(child) {
+			t.Errorf("expected sibling %d to be prefetched after scan detection", child)
+		}
+	}
+
+	stats := re.Stats()
+	if stats.BtreeHits == 0 {
+		t.Fatal("expected BtreeHits > 0 after scan detection")
+	}
+}
+
+func TestReadaheadEngine_PointSelectNoPrefetch(t *testing.T) {
+	src := newReadaheadTestSource(500)
+	cache := newMockCache()
+	p := New(src, cache)
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
+	p.SetReadahead(re)
+
+	// Interior page with children [10, 20, 30, 40, 50] (0-based).
+	btreeChildren := []uint32{11, 21, 31, 41, 51}
+	interiorPage := buildInteriorTablePage(4096, btreeChildren)
+	re.btree.OnFetchComplete(2, interiorPage)
+
+	// Access only child[0] — point select, no scan detected.
+	_, err := p.GetPage(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Siblings should NOT be prefetched.
+	for _, child := range []int64{20, 30, 40, 50} {
+		if cache.Has(child) {
+			t.Errorf("expected sibling %d NOT to be prefetched on point select", child)
+		}
+	}
+
+	stats := re.Stats()
+	if stats.BtreeHits != 0 {
+		t.Fatal("expected no BtreeHits on point select")
+	}
+}
+
+func TestReadaheadEngine_ScanFromNotifyPageRead(t *testing.T) {
+	src := newReadaheadTestSource(500)
+	cache := newMockCache()
+	p := New(src, cache)
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
+	p.SetReadahead(re)
+
+	// Interior page with children [10, 20, 30, 40, 50] (0-based).
+	btreeChildren := []uint32{11, 21, 31, 41, 51}
+	interiorPage := buildInteriorTablePage(4096, btreeChildren)
+	re.btree.OnFetchComplete(2, interiorPage)
+
+	// Access child[0] via GetPage (cache miss).
+	_, err := p.GetPage(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Access child[1] via NotifyPageRead (simulates cache hit path).
+	// First put page 20 in cache so it looks like a cache hit.
+	cache.Put(20, make([]byte, 4096))
+	p.NotifyPageRead(20, make([]byte, 4096))
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Scan should be detected: remaining siblings [30, 40, 50] prefetched.
+	for _, child := range []int64{30, 40, 50} {
+		if !cache.Has(child) {
+			t.Errorf("expected sibling %d to be prefetched after NotifyPageRead scan detection", child)
+		}
+	}
+
+	stats := re.Stats()
+	if stats.BtreeHits == 0 {
+		t.Fatal("expected BtreeHits > 0 after scan detection via NotifyPageRead")
+	}
+}
+
+func TestReadaheadEngine_NonConsecutiveNoPrefetch(t *testing.T) {
+	src := newReadaheadTestSource(500)
+	cache := newMockCache()
+	p := New(src, cache)
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
+	p.SetReadahead(re)
+
+	// Interior page with children [10, 20, 30, 40, 50] (0-based).
+	btreeChildren := []uint32{11, 21, 31, 41, 51}
+	interiorPage := buildInteriorTablePage(4096, btreeChildren)
+	re.btree.OnFetchComplete(2, interiorPage)
+
+	// Access child[0] then child[3] (skip children[1] and [2]) — not consecutive.
+	_, err := p.GetPage(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.GetPage(context.Background(), 40)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// No scan detected → siblings should NOT be prefetched (except 10 and 40 themselves).
+	for _, child := range []int64{20, 30, 50} {
+		if cache.Has(child) {
+			t.Errorf("expected sibling %d NOT to be prefetched on non-consecutive access", child)
+		}
+	}
+
+	stats := re.Stats()
+	if stats.BtreeHits != 0 {
+		t.Fatal("expected no BtreeHits on non-consecutive access")
+	}
+}
+
+// --- Overflow Chain Tests ---
+
+// buildOverflowPage creates a simulated overflow page with a next-page pointer.
+// nextPgno is 1-based (0 means last page in chain).
+func buildOverflowPage(pageSize int, nextPgno uint32) []byte {
+	page := make([]byte, pageSize)
+	binary.BigEndian.PutUint32(page[0:4], nextPgno)
+	// Fill rest with payload data.
+	for i := 4; i < pageSize; i++ {
+		page[i] = 0xBB
+	}
+	return page
+}
+
+func TestReadaheadEngine_OverflowFromLeafPage(t *testing.T) {
+	// Build a leaf table page with one cell that overflows to page 200 (1-based).
+	cells := []leafCell{
+		{payloadSize: 5000, rowid: 1, overflowPgno: 200},
+	}
+	leafPage := buildLeafTablePage(4096, cells)
+
+	// Build overflow pages: 200 → 201 → 202 → 0 (end of chain). All 1-based.
+	ovfl200 := buildOverflowPage(4096, 201) // next = 201
+	ovfl201 := buildOverflowPage(4096, 202) // next = 202
+	ovfl202 := buildOverflowPage(4096, 0)   // last in chain
+
+	src := &readaheadTestSource{data: map[int64][]byte{
+		10:  leafPage,
+		199: ovfl200, // 0-based for page 200 (1-based)
+		200: ovfl201, // 0-based for page 201 (1-based)
+		201: ovfl202, // 0-based for page 202 (1-based)
+	}}
+	cache := newMockCache()
+	p := New(src, cache)
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
+	p.SetReadahead(re)
+
+	// Fetch the leaf page — should trigger overflow detection.
+	_, err := p.GetPage(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// The first overflow page (0-based 199) should have been prefetched.
+	if !cache.Has(199) {
+		t.Error("expected first overflow page (0-based 199) to be prefetched")
+	}
+}
+
+func TestReadaheadEngine_OverflowCascade(t *testing.T) {
+	// Build overflow chain: page 300→301→302→0 (1-based).
+	ovfl300 := buildOverflowPage(4096, 301) // next = 301 (1-based)
+	ovfl301 := buildOverflowPage(4096, 302) // next = 302
+	ovfl302 := buildOverflowPage(4096, 0)   // end
+
+	// Build a leaf page that points to overflow page 300 (1-based).
+	cells := []leafCell{
+		{payloadSize: 5000, rowid: 1, overflowPgno: 300},
+	}
+	leafPage := buildLeafTablePage(4096, cells)
+
+	src := &readaheadTestSource{data: map[int64][]byte{
+		10:  leafPage,
+		299: ovfl300, // 0-based for 300
+		300: ovfl301, // 0-based for 301
+		301: ovfl302, // 0-based for 302
+	}}
+	cache := newMockCache()
+	p := New(src, cache)
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
+	p.SetReadahead(re)
+
+	// Fetch leaf page → triggers overflow page 299 (0-based) prefetch.
+	_, err := p.GetPage(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// Overflow pages should cascade: 299 → 300 → 301.
+	for _, pg := range []int64{299, 300, 301} {
+		if !cache.Has(pg) {
+			t.Errorf("expected overflow page %d to be prefetched via cascade", pg)
+		}
+	}
+
+	stats := re.Stats()
+	if stats.OverflowHit == 0 {
+		t.Error("expected OverflowHit > 0 from cascade")
+	}
+}
+
+func TestReadaheadEngine_OverflowWithBtreeInteraction(t *testing.T) {
+	// Simulate a table scan with large blobs: interior page → leaf pages
+	// with overflow chains.
+
+	// Interior table page at 0-based page 2, children: leaf pages 10, 11 (1-based: 11, 12).
+	interiorChildren := []uint32{11, 12}
+	interiorPage := buildInteriorTablePage(4096, interiorChildren)
+
+	// Leaf page 10 (0-based) has a large cell overflowing to page 500 (1-based).
+	leaf10Cells := []leafCell{
+		{payloadSize: 5000, rowid: 1, overflowPgno: 500},
+	}
+	leaf10 := buildLeafTablePage(4096, leaf10Cells)
+
+	// Leaf page 11 (0-based) has a large cell overflowing to page 600 (1-based).
+	leaf11Cells := []leafCell{
+		{payloadSize: 5000, rowid: 2, overflowPgno: 600},
+	}
+	leaf11 := buildLeafTablePage(4096, leaf11Cells)
+
+	// Overflow pages.
+	ovfl500 := buildOverflowPage(4096, 0) // single page chain
+	ovfl600 := buildOverflowPage(4096, 0)
+
+	src := &readaheadTestSource{data: map[int64][]byte{
+		2:   interiorPage,
+		10:  leaf10,
+		11:  leaf11,
+		499: ovfl500, // 0-based for page 500
+		599: ovfl600, // 0-based for page 600
+	}}
+	cache := newMockCache()
+	p := New(src, cache)
+	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
+	p.SetReadahead(re)
+
+	// 1. Fetch interior page → btree tracker learns children.
+	_, err := p.GetPage(context.Background(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// 2. Fault on first leaf child → scan detection needs two consecutive.
+	_, err = p.GetPage(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 3. Fault on second leaf child → scan detected, but only 2 children so
+	//    child 11 is the last child (Predict returns PredictLastChild).
+	_, err = p.GetPage(context.Background(), 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// Leaf page 10 had overflow → should prefetch page 499.
+	if !cache.Has(499) {
+		t.Error("expected overflow page 499 to be prefetched from leaf 10")
+	}
+
+	stats := re.Stats()
+	if stats.BtreeParsed == 0 {
+		t.Error("expected btree parsed > 0")
 	}
 }

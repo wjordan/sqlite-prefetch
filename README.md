@@ -12,14 +12,15 @@ Traditional prefetchers use sequential or stride heuristics to guess what pages 
 
 SQLite's own [B-tree interior pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) already contain the answer: each interior page stores an array of child page pointers (typically ~450 per 4KB page). By parsing these pages as they're fetched, we can predict exactly which leaf pages will be needed next — no heuristics required. A single interior page hit yields all of its children, converging queries to 1-2 blocking faults per B-tree level regardless of fragmentation.
 
-The library combines this B-tree prediction with adaptive readahead, multi-source scheduling, and peer routing into a composable set of components:
+The library combines this B-tree prediction with scan detection, multi-source scheduling, and peer routing into a composable set of components:
 
 | Component | Role |
 |---|---|
 | **Prefetcher** | Entry point. Deduplicates concurrent faults so parallel readahead and application reads share a single in-flight fetch per page. |
 | **Scheduler** | Ranks multiple storage backends by estimated cost (`latency + size/bandwidth`) and issues [hedged requests](https://research.google/pubs/the-tail-at-scale/) to cut tail latency. |
-| **ReadaheadEngine** | Classifies access patterns (sequential, stride, random), sizes a prefetch window using [AIMD](https://en.wikipedia.org/wiki/Additive_increase/multiplicative_decrease), and backs off when prefetched pages go unused. |
-| **btreeTracker** | Parses [interior table pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) (page flag `0x05`) for exact child-page prediction, with multi-level lookahead to stay ahead of SQLite's descent. |
+| **ReadaheadEngine** | Detects scans via two-consecutive-sibling accesses under the same B-tree parent, then prefetches remaining siblings. Point selects (single child access) trigger no prefetch. Delegates prediction to the B-tree tracker and overflow chain prefetcher. |
+| **btreeTracker** | Parses [interior B-tree pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) (table `0x05` and index `0x02`) for exact child-page prediction, with multi-level lookahead to stay ahead of SQLite's descent. |
+| **Overflow prefetcher** | Parses [leaf table pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) (`0x0D`) to find first overflow page numbers, then cascades through the linked-list chain via next-page pointers. |
 | **PeerRouter** | Learns which peer nodes cache which pages via fetch outcomes, using [EWMA](https://en.wikipedia.org/wiki/Exponential_smoothing) hit-rate tracking and B-tree sibling amplification to route requests efficiently. |
 
 Each component is optional. You can use just the `Prefetcher` for deduplication, add the `Scheduler` for multi-source fetching, or enable the full stack for autonomous B-tree-aware prefetching.
@@ -48,8 +49,7 @@ sched.SetSources([]prefetch.Source{s3Source, peerSource})
 p.SetScheduler(sched)
 
 // Optional: readahead with B-tree awareness.
-wt := prefetch.NewWasteTracker()
-re := prefetch.NewReadaheadEngine(p, sched, cache, wt, prefetch.ReadaheadConfig{})
+re := prefetch.NewReadaheadEngine(p, cache, prefetch.ReadaheadConfig{})
 p.SetReadahead(re)
 
 // Fetch pages — dedup, readahead, and B-tree prediction happen automatically.
@@ -102,23 +102,31 @@ type PeerTransport interface {
 
 ### B-tree prediction
 
-SQLite interior table pages (flag `0x05`) contain an array of child page pointers — typically ~450 children per 4KB page. When the prefetcher fetches an interior page, the `btreeTracker` parses it and records the parent-to-child mapping. On the next leaf page fault, `Predict()` returns all remaining siblings, letting the engine prefetch them before SQLite asks.
+SQLite interior pages (table flag `0x05`, index flag `0x02`) contain an array of child page pointers — typically ~450 children per 4KB page. Both page types share identical child-pointer layout. When the prefetcher fetches an interior page, the `btreeTracker` parses it and records the parent-to-child mapping. On subsequent leaf page accesses, `Predict()` returns all remaining siblings, letting the engine prefetch them before SQLite asks.
+
+This covers both table scans and covering index scans (e.g., `SELECT indexed_col FROM t WHERE indexed_col BETWEEN x AND y`), where SQLite reads only from the index B-tree.
 
 When remaining siblings drop below a threshold, multi-level lookahead prefetches the *next interior sibling* so its children are parsed before SQLite descends into them.
 
 See: [SQLite file format: Interior Pages of Table B-Trees](https://www.sqlite.org/fileformat2.html#b_tree_pages)
 
+### Scan detection
+
+The `ReadaheadEngine` gates prefetch behind scan detection, analogous to the Linux kernel's `ondemand_readahead`. B-tree predictions are exact (interior pages encode their children), but prefetching all siblings on a single child access would be wasteful for point selects — a large interior page may have ~450 children, and a point select only needs one.
+
+The detection is simple: when two consecutive sibling accesses occur under the same parent (child[i] followed by child[i+1]), a scan is detected and the remaining siblings are prefetched. This works on both cache misses (`GetPage`) and cache hits (`NotifyPageRead`), so the engine can detect scans even when pages are already warm.
+
+Single-child accesses (point selects, random lookups) never trigger prefetch.
+
+### Overflow chain prefetching
+
+When a row's payload exceeds the [local storage limit](https://www.sqlite.org/fileformat2.html#ovflpgs), SQLite stores the excess on overflow pages — a linked list where each page's first 4 bytes point to the next. These pages aren't children of any interior page, so the B-tree tracker can't predict them.
+
+The overflow prefetcher handles this by parsing leaf table pages (`0x0D`) when they're fetched, extracting the first overflow page number from each cell that exceeds `maxLocal`. Those pages are prefetched immediately. When an overflow page arrives, its next-page pointer is read and the next page in the chain is prefetched, cascading through the entire chain without blocking on SQLite's sequential reads.
+
 ### Hedged requests
 
 The `Scheduler` implements [hedged requests](https://research.google/pubs/the-tail-at-scale/) from Google's "The Tail at Scale" (Dean & Barroso, 2013). It starts the best source immediately and fires a fallback after `1.5x best_latency`. The first successful response wins; the other is cancelled.
-
-### Adaptive readahead
-
-The `ReadaheadEngine` uses:
-- **Pattern classification** -- ring buffer of recent pages with delta analysis to detect sequential (+1), stride (constant delta), or random access (inspired by [Leap](https://www.usenix.org/conference/atc20/presentation/maruf), USENIX ATC '20)
-- **[AIMD](https://en.wikipedia.org/wiki/Additive_increase/multiplicative_decrease) window** -- doubles on confirmed prediction, halves on miss
-- **Depth limiting** -- `ceil(workers x source_latency / inter_fault_interval)` bounds prefetch to what can complete before the next fault
-- **Waste feedback** -- tracks eviction of prefetched-but-never-read pages, shrinks max window when waste exceeds 30%
 
 ### Peer routing
 
@@ -130,9 +138,8 @@ The `PeerRouter` learns which peers have which pages through fetch outcomes:
 
 ## References
 
-- [SQLite Database File Format](https://www.sqlite.org/fileformat2.html) -- page layout, B-tree structure, interior page format
+- [SQLite Database File Format](https://www.sqlite.org/fileformat2.html) -- page layout, B-tree structure, interior page format, overflow pages
 - [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) (Dean & Barroso, 2013) -- hedged requests for tail latency
-- [Leap: Prefetcher for Distributed File Systems](https://www.usenix.org/conference/atc20/presentation/maruf) (Maruf et al., USENIX ATC '20) -- pattern classification for prefetching
 
 ## Dependencies
 
