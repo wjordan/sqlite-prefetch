@@ -217,40 +217,6 @@ func TestParseLeafTableOverflows_NotLeafTable(t *testing.T) {
 	}
 }
 
-func TestTracker_Siblings(t *testing.T) {
-	bt := NewTracker(1024)
-	// 1-based [11, 21, 31, 41, 51] → 0-based [10, 20, 30, 40, 50]
-	children := []uint32{11, 21, 31, 41, 51}
-	page := BuildInteriorTablePage(4096, children)
-	bt.OnFetchComplete(2, page)
-
-	// Siblings of any child should return all children.
-	sibs := bt.Siblings(20)
-	if len(sibs) != 5 {
-		t.Fatalf("expected 5 siblings, got %d", len(sibs))
-	}
-	want := []uint32{10, 20, 30, 40, 50}
-	for i, s := range sibs {
-		if s != want[i] {
-			t.Errorf("sibling[%d] = %d, want %d", i, s, want[i])
-		}
-	}
-
-	// First child also returns all siblings.
-	sibs = bt.Siblings(10)
-	if len(sibs) != 5 {
-		t.Fatalf("expected 5 siblings for first child, got %d", len(sibs))
-	}
-}
-
-func TestTracker_Siblings_Unknown(t *testing.T) {
-	bt := NewTracker(1024)
-	sibs := bt.Siblings(999)
-	if sibs != nil {
-		t.Fatalf("expected nil for unknown page, got %v", sibs)
-	}
-}
-
 func TestTracker_PredictSiblings(t *testing.T) {
 	bt := NewTracker(1024)
 	// Page data contains 1-based SQLite pgno values; OnFetchComplete converts

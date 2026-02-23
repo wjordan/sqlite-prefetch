@@ -280,19 +280,6 @@ func (t *Tracker) ChildPosition(pageNo uint32) (parent uint32, index int, ok boo
 	return 0, -1, false
 }
 
-// Siblings returns all children of pageNo's parent (the full sibling set),
-// including pageNo itself. Returns nil if pageNo is not a known child.
-func (t *Tracker) Siblings(pageNo uint32) []uint32 {
-	parent, ok := t.childToParent[pageNo]
-	if !ok {
-		return nil
-	}
-	children := t.interiorChildren[parent]
-	result := make([]uint32, len(children))
-	copy(result, children)
-	return result
-}
-
 // Children returns the child page numbers for an interior page, or ok=false
 // if the page hasn't been parsed yet. Returns a copy.
 func (t *Tracker) Children(interiorPage uint32) ([]uint32, bool) {

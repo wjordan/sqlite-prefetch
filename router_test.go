@@ -2,7 +2,6 @@ package prefetch
 
 import (
 	"context"
-	"math/rand"
 	"testing"
 
 	"github.com/wjordan/sqlite-prefetch/pagefault"
@@ -206,97 +205,6 @@ func runWithAvailability(sc routingScenario) routingMetrics {
 	return m
 }
 
-func runWithBloomFilter(sc routingScenario) routingMetrics {
-	type peerBloom struct {
-		id     string
-		pages  map[int64]bool
-		filter *bloomSim
-	}
-	var peers []peerBloom
-	for _, sp := range sc.peers {
-		bf := newBloomSim(len(sp.pages), 0.01)
-		for pg := range sp.pages {
-			bf.add(pg)
-		}
-		peers = append(peers, peerBloom{id: sp.id, pages: sp.pages, filter: bf})
-	}
-
-	var m routingMetrics
-	rng := rand.New(rand.NewSource(42))
-
-	for _, pageNo := range sc.accessPattern {
-		var candidates []peerBloom
-		for _, pb := range peers {
-			if pb.filter.test(pageNo) {
-				candidates = append(candidates, pb)
-			}
-		}
-
-		if len(candidates) == 0 {
-			m.s3Fallbacks++
-		} else {
-			chosen := candidates[rng.Intn(len(candidates))]
-			if chosen.pages[pageNo] {
-				m.peerHits++
-			} else {
-				m.peerMisses++
-			}
-		}
-	}
-
-	total := m.peerHits + m.peerMisses
-	if total > 0 {
-		m.hitRate = float64(m.peerHits) / float64(total)
-	}
-	return m
-}
-
-// bloomSim is a simple simulation bloom filter for comparison testing.
-type bloomSim struct {
-	bits []bool
-	k    int
-}
-
-func newBloomSim(n int, fpRate float64) *bloomSim {
-	if n < 1 {
-		n = 1
-	}
-	m := int(-float64(n) * 4.0 / 0.48)
-	if m < 64 {
-		m = 64
-	}
-	k := int(float64(m) / float64(n) * 0.693)
-	if k < 1 {
-		k = 1
-	}
-	return &bloomSim{bits: make([]bool, m), k: k}
-}
-
-func (b *bloomSim) add(pageNo int64) {
-	for _, pos := range b.hashes(pageNo) {
-		b.bits[pos] = true
-	}
-}
-
-func (b *bloomSim) test(pageNo int64) bool {
-	for _, pos := range b.hashes(pageNo) {
-		if !b.bits[pos] {
-			return false
-		}
-	}
-	return true
-}
-
-func (b *bloomSim) hashes(pageNo int64) []int {
-	h1 := uint64(pageNo)*2654435761 + 1
-	h2 := uint64(pageNo)*40503 + 17
-	result := make([]int, b.k)
-	for i := 0; i < b.k; i++ {
-		result[i] = int((h1 + uint64(i)*h2) % uint64(len(b.bits)))
-	}
-	return result
-}
-
 // --- Null implementations for test infrastructure ---
 
 type nullSource struct{}
@@ -345,12 +253,9 @@ func TestRoutingScenario_TableScan(t *testing.T) {
 	}
 
 	result := runWithAvailability(sc)
-	bloomResult := runWithBloomFilter(sc)
 
 	t.Logf("Availability: hitRate=%.2f hits=%d misses=%d s3=%d",
 		result.hitRate, result.peerHits, result.peerMisses, result.s3Fallbacks)
-	t.Logf("BloomFilter: hitRate=%.2f hits=%d misses=%d s3=%d",
-		bloomResult.hitRate, bloomResult.peerHits, bloomResult.peerMisses, bloomResult.s3Fallbacks)
 
 	// With pre-populated availability, hit rate should be 100%.
 	if result.hitRate < 1.0 {
