@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/wjordan/sqlite-prefetch/pagefault"
+	"github.com/wjordan/sqlite-prefetch/sqlitebtree"
 )
 
 // --- ReadaheadEngine Tests ---
@@ -35,24 +39,69 @@ func (s *readaheadTestSource) GetPage(_ context.Context, pageNo int64) ([]byte, 
 	return make([]byte, 4096), nil
 }
 
+type mockCache struct {
+	mu    sync.Mutex
+	pages map[int64][]byte
+}
+
+func newMockCache() *mockCache {
+	return &mockCache{pages: make(map[int64][]byte)}
+}
+
+func (c *mockCache) Get(pageNo int64) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.pages[pageNo]
+	return d, ok
+}
+
+func (c *mockCache) CopyTo(pageNo int64, dst []byte) (int, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.pages[pageNo]
+	if !ok {
+		return 0, false
+	}
+	return copy(dst, d), true
+}
+
+func (c *mockCache) Put(pageNo int64, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	c.pages[pageNo] = cp
+}
+
+func (c *mockCache) PutPrefetched(pageNo int64, data []byte) {
+	c.Put(pageNo, data)
+}
+
+func (c *mockCache) Has(pageNo int64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.pages[pageNo]
+	return ok
+}
+
 func TestReadaheadEngine_BtreeWithIndexPages(t *testing.T) {
 	src := newReadaheadTestSource(200)
 	cache := newMockCache()
-	p := New(src, cache)
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
-	p.SetReadahead(re)
+	f := pagefault.New(src, cache)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
+	f.SetObserver(re)
 
 	// Build interior index page (flag 0x02) with children 100-149.
 	indexChildren := make([]uint32, 50)
 	for i := range indexChildren {
 		indexChildren[i] = uint32(101 + i) // 1-based
 	}
-	interiorPage := buildInteriorTablePage(4096, indexChildren)
+	interiorPage := sqlitebtree.BuildInteriorTablePage(4096, indexChildren)
 	interiorPage[0] = 0x02 // interior index
 	src.data[5] = interiorPage
 
 	// Fetch interior index page — should be parsed by btree tracker.
-	_, err := p.GetPage(context.Background(), 5)
+	_, err := f.GetPage(context.Background(), 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +109,7 @@ func TestReadaheadEngine_BtreeWithIndexPages(t *testing.T) {
 
 	// Access two consecutive children to trigger scan detection.
 	for i := int64(100); i < 103; i++ {
-		_, err := p.GetPage(context.Background(), i)
+		_, err := f.GetPage(context.Background(), i)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -86,14 +135,14 @@ func TestReadaheadEngine_BtreeWithIndexPages(t *testing.T) {
 func TestReadaheadEngine_RandomNoTrigger(t *testing.T) {
 	src := newReadaheadTestSource(200)
 	cache := newMockCache()
-	p := New(src, cache)
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
-	p.SetReadahead(re)
+	f := pagefault.New(src, cache)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
+	f.SetObserver(re)
 
 	// Simulate random page faults (not known btree children).
 	randoms := []int64{5, 100, 3, 150, 42, 199, 1, 88, 77, 12}
 	for _, pg := range randoms {
-		_, err := p.GetPage(context.Background(), pg)
+		_, err := f.GetPage(context.Background(), pg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -113,8 +162,8 @@ func TestReadaheadEngine_RandomNoTrigger(t *testing.T) {
 func TestReadaheadEngine_Reset(t *testing.T) {
 	src := newReadaheadTestSource(100)
 	cache := newMockCache()
-	p := New(src, cache)
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
+	f := pagefault.New(src, cache)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
 
 	// Build up some state.
 	re.scanParent = 42
@@ -137,10 +186,10 @@ func TestReadaheadEngine_Reset(t *testing.T) {
 func TestReadaheadEngine_BoundedWorkers(t *testing.T) {
 	src := newReadaheadTestSource(100)
 	cache := newMockCache()
-	p := New(src, cache)
+	f := pagefault.New(src, cache)
 
 	workers := 2
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: workers})
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: workers})
 
 	// Worker semaphore should have capacity = workers.
 	if cap(re.workerSem) != workers {
@@ -148,20 +197,20 @@ func TestReadaheadEngine_BoundedWorkers(t *testing.T) {
 	}
 }
 
-func TestPrefetcher_GetPageTriggersOnPageAccess(t *testing.T) {
+func TestFetcher_GetPageTriggersOnAccess(t *testing.T) {
 	src := newReadaheadTestSource(100)
 	cache := newMockCache()
-	p := New(src, cache)
+	f := pagefault.New(src, cache)
 
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 2})
-	p.SetReadahead(re)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 2})
+	f.SetObserver(re)
 
-	_, err := p.GetPage(context.Background(), 5)
+	_, err := f.GetPage(context.Background(), 5)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Page 5 is not a known btree child, so OnPageAccess should reset
+	// Page 5 is not a known btree child, so OnAccess should reset
 	// scan state without triggering prefetch.
 	stats := re.Stats()
 	if stats.BtreeHits != 0 {
@@ -169,57 +218,52 @@ func TestPrefetcher_GetPageTriggersOnPageAccess(t *testing.T) {
 	}
 }
 
-func TestPrefetcher_InternalSkipsOnPageAccess(t *testing.T) {
+func TestFetcher_PrefetchSkipsOnAccess(t *testing.T) {
 	src := newReadaheadTestSource(100)
 	cache := newMockCache()
-	p := New(src, cache)
+	f := pagefault.New(src, cache)
 
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 2})
-	p.SetReadahead(re)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 2})
+	f.SetObserver(re)
 
-	// getPageInternal should NOT trigger OnPageAccess.
-	_, err := p.getPageInternal(context.Background(), 5, true)
+	// Prefetch should NOT trigger OnAccess.
+	_, err := f.Prefetch(context.Background(), 5)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// No OnPageAccess called → btree hits should be 0, scan state untouched.
+	// No OnAccess called → btree hits should be 0, scan state untouched.
 	stats := re.Stats()
 	if stats.BtreeHits != 0 {
-		t.Fatal("expected getPageInternal to NOT trigger OnPageAccess")
+		t.Fatal("expected Prefetch to NOT trigger OnAccess")
 	}
 
-	// Verify it was cached as prefetched.
+	// Verify it was cached.
 	if _, ok := cache.Get(5); !ok {
 		t.Fatal("expected page 5 to be cached")
 	}
 }
 
-// testReadaheadEngine is a stub for testing.
-type testReadaheadEngine struct {
-	onFault func(pageNo int64)
-}
-
 func TestReadaheadEngine_BtreePrefetchesChildren(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
-	p := New(src, cache)
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
-	p.SetReadahead(re)
+	f := pagefault.New(src, cache)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
+	f.SetObserver(re)
 
 	// Feed an interior page to the B-tree tracker. Page data contains 1-based
-	// SQLite pgno values; OnFetchComplete converts to 0-based: [42, 17, 203, 8, 156].
+	// SQLite pgno values; OnFetch converts to 0-based: [42, 17, 203, 8, 156].
 	btreeChildren := []uint32{43, 18, 204, 9, 157}
-	interiorPage := buildInteriorTablePage(4096, btreeChildren)
-	re.btree.OnFetchComplete(2, interiorPage)
+	interiorPage := sqlitebtree.BuildInteriorTablePage(4096, btreeChildren)
+	re.OnFetch(2, interiorPage)
 
 	// Access two consecutive children (42 then 17 = children[0] then children[1])
 	// to trigger scan detection.
-	_, err := p.GetPage(context.Background(), 42)
+	_, err := f.GetPage(context.Background(), 42)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = p.GetPage(context.Background(), 17)
+	_, err = f.GetPage(context.Background(), 17)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,20 +281,20 @@ func TestReadaheadEngine_BtreePrefetchesChildren(t *testing.T) {
 func TestReadaheadEngine_BtreeRandomPattern(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
-	p := New(src, cache)
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
-	p.SetReadahead(re)
+	f := pagefault.New(src, cache)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
+	f.SetObserver(re)
 
 	// Feed an interior page with scattered children. Page data is 1-based;
-	// OnFetchComplete converts to 0-based: [400, 50, 300, 150, 250, 100].
+	// OnFetch converts to 0-based: [400, 50, 300, 150, 250, 100].
 	btreeChildren := []uint32{401, 51, 301, 151, 251, 101}
-	interiorPage := buildInteriorTablePage(4096, btreeChildren)
-	re.btree.OnFetchComplete(2, interiorPage)
+	interiorPage := sqlitebtree.BuildInteriorTablePage(4096, btreeChildren)
+	re.OnFetch(2, interiorPage)
 
 	// Access two consecutive children (400 then 50 = children[0] then children[1])
 	// to trigger scan detection, then continue.
 	for _, pg := range []int64{400, 50, 300} {
-		_, err := p.GetPage(context.Background(), pg)
+		_, err := f.GetPage(context.Background(), pg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -271,21 +315,21 @@ func TestReadaheadEngine_BtreeRandomPattern(t *testing.T) {
 func TestReadaheadEngine_ScanDetectsConsecutiveSiblings(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
-	p := New(src, cache)
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
-	p.SetReadahead(re)
+	f := pagefault.New(src, cache)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
+	f.SetObserver(re)
 
 	// Interior page with children [10, 20, 30, 40, 50] (0-based).
 	btreeChildren := []uint32{11, 21, 31, 41, 51} // 1-based
-	interiorPage := buildInteriorTablePage(4096, btreeChildren)
-	re.btree.OnFetchComplete(2, interiorPage)
+	interiorPage := sqlitebtree.BuildInteriorTablePage(4096, btreeChildren)
+	re.OnFetch(2, interiorPage)
 
 	// Access child[0] then child[1] → scan detected, prefetch remaining.
-	_, err := p.GetPage(context.Background(), 10)
+	_, err := f.GetPage(context.Background(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = p.GetPage(context.Background(), 20)
+	_, err = f.GetPage(context.Background(), 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,17 +352,17 @@ func TestReadaheadEngine_ScanDetectsConsecutiveSiblings(t *testing.T) {
 func TestReadaheadEngine_PointSelectNoPrefetch(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
-	p := New(src, cache)
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
-	p.SetReadahead(re)
+	f := pagefault.New(src, cache)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
+	f.SetObserver(re)
 
 	// Interior page with children [10, 20, 30, 40, 50] (0-based).
 	btreeChildren := []uint32{11, 21, 31, 41, 51}
-	interiorPage := buildInteriorTablePage(4096, btreeChildren)
-	re.btree.OnFetchComplete(2, interiorPage)
+	interiorPage := sqlitebtree.BuildInteriorTablePage(4096, btreeChildren)
+	re.OnFetch(2, interiorPage)
 
 	// Access only child[0] — point select, no scan detected.
-	_, err := p.GetPage(context.Background(), 10)
+	_, err := f.GetPage(context.Background(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,69 +382,68 @@ func TestReadaheadEngine_PointSelectNoPrefetch(t *testing.T) {
 	}
 }
 
-func TestReadaheadEngine_ScanFromNotifyPageRead(t *testing.T) {
+func TestReadaheadEngine_ScanFromNotifyRead(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
-	p := New(src, cache)
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
-	p.SetReadahead(re)
+	f := pagefault.New(src, cache)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
+	f.SetObserver(re)
 
 	// Interior page with children [10, 20, 30, 40, 50] (0-based).
 	btreeChildren := []uint32{11, 21, 31, 41, 51}
-	interiorPage := buildInteriorTablePage(4096, btreeChildren)
-	re.btree.OnFetchComplete(2, interiorPage)
+	interiorPage := sqlitebtree.BuildInteriorTablePage(4096, btreeChildren)
+	re.OnFetch(2, interiorPage)
 
 	// Access child[0] via GetPage (cache miss).
-	_, err := p.GetPage(context.Background(), 10)
+	_, err := f.GetPage(context.Background(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Access child[1] via NotifyPageRead (simulates cache hit path).
-	// First put page 20 in cache so it looks like a cache hit.
+	// Access child[1] via NotifyRead (simulates cache hit path).
 	cache.Put(20, make([]byte, 4096))
-	p.NotifyPageRead(20, make([]byte, 4096))
+	f.NotifyRead(20, make([]byte, 4096))
 
 	time.Sleep(50 * time.Millisecond)
 
 	// Scan should be detected: remaining siblings [30, 40, 50] prefetched.
 	for _, child := range []int64{30, 40, 50} {
 		if !cache.Has(child) {
-			t.Errorf("expected sibling %d to be prefetched after NotifyPageRead scan detection", child)
+			t.Errorf("expected sibling %d to be prefetched after NotifyRead scan detection", child)
 		}
 	}
 
 	stats := re.Stats()
 	if stats.BtreeHits == 0 {
-		t.Fatal("expected BtreeHits > 0 after scan detection via NotifyPageRead")
+		t.Fatal("expected BtreeHits > 0 after scan detection via NotifyRead")
 	}
 }
 
 func TestReadaheadEngine_NonConsecutiveNoPrefetch(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
-	p := New(src, cache)
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
-	p.SetReadahead(re)
+	f := pagefault.New(src, cache)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
+	f.SetObserver(re)
 
 	// Interior page with children [10, 20, 30, 40, 50] (0-based).
 	btreeChildren := []uint32{11, 21, 31, 41, 51}
-	interiorPage := buildInteriorTablePage(4096, btreeChildren)
-	re.btree.OnFetchComplete(2, interiorPage)
+	interiorPage := sqlitebtree.BuildInteriorTablePage(4096, btreeChildren)
+	re.OnFetch(2, interiorPage)
 
 	// Access child[0] then child[3] (skip children[1] and [2]) — not consecutive.
-	_, err := p.GetPage(context.Background(), 10)
+	_, err := f.GetPage(context.Background(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = p.GetPage(context.Background(), 40)
+	_, err = f.GetPage(context.Background(), 40)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(50 * time.Millisecond)
 
-	// No scan detected → siblings should NOT be prefetched (except 10 and 40 themselves).
+	// No scan detected → siblings should NOT be prefetched.
 	for _, child := range []int64{20, 30, 50} {
 		if cache.Has(child) {
 			t.Errorf("expected sibling %d NOT to be prefetched on non-consecutive access", child)
@@ -420,7 +463,6 @@ func TestReadaheadEngine_NonConsecutiveNoPrefetch(t *testing.T) {
 func buildOverflowPage(pageSize int, nextPgno uint32) []byte {
 	page := make([]byte, pageSize)
 	binary.BigEndian.PutUint32(page[0:4], nextPgno)
-	// Fill rest with payload data.
 	for i := 4; i < pageSize; i++ {
 		page[i] = 0xBB
 	}
@@ -428,72 +470,64 @@ func buildOverflowPage(pageSize int, nextPgno uint32) []byte {
 }
 
 func TestReadaheadEngine_OverflowFromLeafPage(t *testing.T) {
-	// Build a leaf table page with one cell that overflows to page 200 (1-based).
-	cells := []leafCell{
-		{payloadSize: 5000, rowid: 1, overflowPgno: 200},
+	cells := []sqlitebtree.LeafCell{
+		{PayloadSize: 5000, Rowid: 1, OverflowPgno: 200},
 	}
-	leafPage := buildLeafTablePage(4096, cells)
+	leafPage := sqlitebtree.BuildLeafTablePage(4096, cells)
 
-	// Build overflow pages: 200 → 201 → 202 → 0 (end of chain). All 1-based.
-	ovfl200 := buildOverflowPage(4096, 201) // next = 201
-	ovfl201 := buildOverflowPage(4096, 202) // next = 202
-	ovfl202 := buildOverflowPage(4096, 0)   // last in chain
+	ovfl200 := buildOverflowPage(4096, 201)
+	ovfl201 := buildOverflowPage(4096, 202)
+	ovfl202 := buildOverflowPage(4096, 0)
 
 	src := &readaheadTestSource{data: map[int64][]byte{
 		10:  leafPage,
-		199: ovfl200, // 0-based for page 200 (1-based)
-		200: ovfl201, // 0-based for page 201 (1-based)
-		201: ovfl202, // 0-based for page 202 (1-based)
+		199: ovfl200,
+		200: ovfl201,
+		201: ovfl202,
 	}}
 	cache := newMockCache()
-	p := New(src, cache)
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
-	p.SetReadahead(re)
+	f := pagefault.New(src, cache)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
+	f.SetObserver(re)
 
-	// Fetch the leaf page — should trigger overflow detection.
-	_, err := p.GetPage(context.Background(), 10)
+	_, err := f.GetPage(context.Background(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	// The first overflow page (0-based 199) should have been prefetched.
 	if !cache.Has(199) {
 		t.Error("expected first overflow page (0-based 199) to be prefetched")
 	}
 }
 
 func TestReadaheadEngine_OverflowCascade(t *testing.T) {
-	// Build overflow chain: page 300→301→302→0 (1-based).
-	ovfl300 := buildOverflowPage(4096, 301) // next = 301 (1-based)
-	ovfl301 := buildOverflowPage(4096, 302) // next = 302
-	ovfl302 := buildOverflowPage(4096, 0)   // end
+	ovfl300 := buildOverflowPage(4096, 301)
+	ovfl301 := buildOverflowPage(4096, 302)
+	ovfl302 := buildOverflowPage(4096, 0)
 
-	// Build a leaf page that points to overflow page 300 (1-based).
-	cells := []leafCell{
-		{payloadSize: 5000, rowid: 1, overflowPgno: 300},
+	cells := []sqlitebtree.LeafCell{
+		{PayloadSize: 5000, Rowid: 1, OverflowPgno: 300},
 	}
-	leafPage := buildLeafTablePage(4096, cells)
+	leafPage := sqlitebtree.BuildLeafTablePage(4096, cells)
 
 	src := &readaheadTestSource{data: map[int64][]byte{
 		10:  leafPage,
-		299: ovfl300, // 0-based for 300
-		300: ovfl301, // 0-based for 301
-		301: ovfl302, // 0-based for 302
+		299: ovfl300,
+		300: ovfl301,
+		301: ovfl302,
 	}}
 	cache := newMockCache()
-	p := New(src, cache)
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
-	p.SetReadahead(re)
+	f := pagefault.New(src, cache)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
+	f.SetObserver(re)
 
-	// Fetch leaf page → triggers overflow page 299 (0-based) prefetch.
-	_, err := p.GetPage(context.Background(), 10)
+	_, err := f.GetPage(context.Background(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	// Overflow pages should cascade: 299 → 300 → 301.
 	for _, pg := range []int64{299, 300, 301} {
 		if !cache.Has(pg) {
 			t.Errorf("expected overflow page %d to be prefetched via cascade", pg)
@@ -507,62 +541,50 @@ func TestReadaheadEngine_OverflowCascade(t *testing.T) {
 }
 
 func TestReadaheadEngine_OverflowWithBtreeInteraction(t *testing.T) {
-	// Simulate a table scan with large blobs: interior page → leaf pages
-	// with overflow chains.
-
-	// Interior table page at 0-based page 2, children: leaf pages 10, 11 (1-based: 11, 12).
 	interiorChildren := []uint32{11, 12}
-	interiorPage := buildInteriorTablePage(4096, interiorChildren)
+	interiorPage := sqlitebtree.BuildInteriorTablePage(4096, interiorChildren)
 
-	// Leaf page 10 (0-based) has a large cell overflowing to page 500 (1-based).
-	leaf10Cells := []leafCell{
-		{payloadSize: 5000, rowid: 1, overflowPgno: 500},
+	leaf10Cells := []sqlitebtree.LeafCell{
+		{PayloadSize: 5000, Rowid: 1, OverflowPgno: 500},
 	}
-	leaf10 := buildLeafTablePage(4096, leaf10Cells)
+	leaf10 := sqlitebtree.BuildLeafTablePage(4096, leaf10Cells)
 
-	// Leaf page 11 (0-based) has a large cell overflowing to page 600 (1-based).
-	leaf11Cells := []leafCell{
-		{payloadSize: 5000, rowid: 2, overflowPgno: 600},
+	leaf11Cells := []sqlitebtree.LeafCell{
+		{PayloadSize: 5000, Rowid: 2, OverflowPgno: 600},
 	}
-	leaf11 := buildLeafTablePage(4096, leaf11Cells)
+	leaf11 := sqlitebtree.BuildLeafTablePage(4096, leaf11Cells)
 
-	// Overflow pages.
-	ovfl500 := buildOverflowPage(4096, 0) // single page chain
+	ovfl500 := buildOverflowPage(4096, 0)
 	ovfl600 := buildOverflowPage(4096, 0)
 
 	src := &readaheadTestSource{data: map[int64][]byte{
 		2:   interiorPage,
 		10:  leaf10,
 		11:  leaf11,
-		499: ovfl500, // 0-based for page 500
-		599: ovfl600, // 0-based for page 600
+		499: ovfl500,
+		599: ovfl600,
 	}}
 	cache := newMockCache()
-	p := New(src, cache)
-	re := NewReadaheadEngine(p, cache, ReadaheadConfig{Workers: 4})
-	p.SetReadahead(re)
+	f := pagefault.New(src, cache)
+	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
+	f.SetObserver(re)
 
-	// 1. Fetch interior page → btree tracker learns children.
-	_, err := p.GetPage(context.Background(), 2)
+	_, err := f.GetPage(context.Background(), 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	// 2. Fault on first leaf child → scan detection needs two consecutive.
-	_, err = p.GetPage(context.Background(), 10)
+	_, err = f.GetPage(context.Background(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 3. Fault on second leaf child → scan detected, but only 2 children so
-	//    child 11 is the last child (Predict returns PredictLastChild).
-	_, err = p.GetPage(context.Background(), 11)
+	_, err = f.GetPage(context.Background(), 11)
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	// Leaf page 10 had overflow → should prefetch page 499.
 	if !cache.Has(499) {
 		t.Error("expected overflow page 499 to be prefetched from leaf 10")
 	}

@@ -3,20 +3,18 @@ package prefetch
 import (
 	"context"
 	"time"
+
+	"github.com/wjordan/sqlite-prefetch/pagefault"
 )
 
 // S3SourceConfig controls the S3Source wrapper behaviour and defaults.
 type S3SourceConfig struct {
-	EgressCostPerByte float64       // Default: $0.09/GB
-	DefaultLatency    time.Duration // Default: 50ms
-	DefaultBandwidth  float64       // Default: 100MB/s (bytes/sec)
-	EWMAAlpha         float64       // Default: 0.3
+	DefaultLatency   time.Duration // Default: 50ms
+	DefaultBandwidth float64       // Default: 100MB/s (bytes/sec)
+	EWMAAlpha        float64       // Default: 0.3
 }
 
 func (c *S3SourceConfig) withDefaults() {
-	if c.EgressCostPerByte <= 0 {
-		c.EgressCostPerByte = 0.09 / (1024 * 1024 * 1024)
-	}
 	if c.DefaultLatency <= 0 {
 		c.DefaultLatency = 50 * time.Millisecond
 	}
@@ -29,24 +27,23 @@ func (c *S3SourceConfig) withDefaults() {
 }
 
 // S3Source wraps a PageSource with Source interface, tracking latency and
-// bandwidth via EWMA. S3 is treated as a complete source (Completeness=1.0,
-// HasPage always true) since it stores the full database.
+// bandwidth via EWMA. S3 always has every page (HasPage always true).
 type S3Source struct {
-	inner     PageSource
+	inner     pagefault.PageSource
 	cfg       S3SourceConfig
-	latency   *ewma
-	bandwidth *ewma
+	latency   *pagefault.EWMA
+	bandwidth *pagefault.EWMA
 }
 
-// Compile-time check that S3Source satisfies Source.
-var _ Source = (*S3Source)(nil)
+// Compile-time check that S3Source satisfies pagefault.Source.
+var _ pagefault.Source = (*S3Source)(nil)
 
 // NewS3Source creates an S3Source wrapping the given PageSource.
-func NewS3Source(inner PageSource, cfg S3SourceConfig) *S3Source {
+func NewS3Source(inner pagefault.PageSource, cfg S3SourceConfig) *S3Source {
 	cfg.withDefaults()
-	lat := newEWMA(cfg.EWMAAlpha)
+	lat := pagefault.NewEWMA(cfg.EWMAAlpha)
 	lat.Update(float64(cfg.DefaultLatency))
-	bw := newEWMA(cfg.EWMAAlpha)
+	bw := pagefault.NewEWMA(cfg.EWMAAlpha)
 	bw.Update(cfg.DefaultBandwidth)
 	return &S3Source{inner: inner, cfg: cfg, latency: lat, bandwidth: bw}
 }
@@ -54,8 +51,6 @@ func NewS3Source(inner PageSource, cfg S3SourceConfig) *S3Source {
 func (s *S3Source) Name() string           { return "s3" }
 func (s *S3Source) Latency() time.Duration { return time.Duration(s.latency.Value()) }
 func (s *S3Source) Bandwidth() float64     { return s.bandwidth.Value() }
-func (s *S3Source) Completeness() float64  { return 1.0 }
-func (s *S3Source) EgressCost() float64    { return s.cfg.EgressCostPerByte }
 func (s *S3Source) HasPage(_ int64) bool   { return true }
 
 // GetPage fetches a page from the inner source, measuring latency and

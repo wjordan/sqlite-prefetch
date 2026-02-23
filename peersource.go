@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"github.com/wjordan/sqlite-prefetch/pagefault"
 )
 
 // PeerTransport opens bidirectional streams to peers for page fetching.
@@ -48,7 +50,7 @@ func (c *PeerSourceConfig) withDefaults() {
 }
 
 // PeerSource fetches pages from a single peer via a bidirectional stream.
-// It implements the Source interface, tracking latency and bandwidth
+// It implements the pagefault.Source interface, tracking latency and bandwidth
 // via EWMA. Peers have zero egress cost and partial completeness
 // (pages available depend on the peer's cache).
 type PeerSource struct {
@@ -57,19 +59,19 @@ type PeerSource struct {
 	addr      string // peer's transport address
 	router    *PeerRouter
 	cfg       PeerSourceConfig
-	latency   *ewma
-	bandwidth *ewma
+	latency   *pagefault.EWMA
+	bandwidth *pagefault.EWMA
 }
 
-// Compile-time check that PeerSource satisfies Source.
-var _ Source = (*PeerSource)(nil)
+// Compile-time check that PeerSource satisfies pagefault.Source.
+var _ pagefault.Source = (*PeerSource)(nil)
 
 // NewPeerSource creates a PeerSource for the given peer.
 func NewPeerSource(t PeerTransport, nodeID, addr string, router *PeerRouter, cfg PeerSourceConfig) *PeerSource {
 	cfg.withDefaults()
-	lat := newEWMA(cfg.EWMAAlpha)
+	lat := pagefault.NewEWMA(cfg.EWMAAlpha)
 	lat.Update(float64(cfg.DefaultLatency))
-	bw := newEWMA(cfg.EWMAAlpha)
+	bw := pagefault.NewEWMA(cfg.EWMAAlpha)
 	bw.Update(cfg.DefaultBandwidth)
 	return &PeerSource{
 		transport: t,
@@ -85,8 +87,6 @@ func NewPeerSource(t PeerTransport, nodeID, addr string, router *PeerRouter, cfg
 func (p *PeerSource) Name() string           { return "peer:" + p.nodeID }
 func (p *PeerSource) Latency() time.Duration { return time.Duration(p.latency.Value()) }
 func (p *PeerSource) Bandwidth() float64     { return p.bandwidth.Value() }
-func (p *PeerSource) Completeness() float64  { return 0.5 }
-func (p *PeerSource) EgressCost() float64    { return 0 }
 
 // HasPage checks the router for whether this peer should be tried for the page.
 // Returns false if no router is set.
@@ -105,7 +105,6 @@ func (p *PeerSource) Addr() string { return p.addr }
 
 // GetPage fetches a page from the peer via a bidirectional stream,
 // measuring latency and bandwidth to update the EWMA trackers.
-// Records hit/miss results in the router for learning.
 func (p *PeerSource) GetPage(ctx context.Context, pageNo int64) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.FetchTimeout)
 	defer cancel()

@@ -1,11 +1,21 @@
-package prefetch
+package pagefault
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 )
+
+// Source is a page data provider with measurable performance properties.
+type Source interface {
+	Name() string
+	Latency() time.Duration
+	Bandwidth() float64
+	HasPage(pageNo int64) bool
+	GetPage(ctx context.Context, pageNo int64) ([]byte, error)
+}
 
 // SchedulerConfig controls the Scheduler behaviour and defaults.
 type SchedulerConfig struct {
@@ -127,7 +137,7 @@ func (s *Scheduler) sourcesForPage(pageNo int64) []Source {
 	}
 	for i := 1; i < len(candidates); i++ {
 		for j := i; j > 0; j-- {
-			if estimatedTime(candidates[j], s.cfg.PageSize) < estimatedTime(candidates[j-1], s.cfg.PageSize) {
+			if EstimatedTime(candidates[j], s.cfg.PageSize) < EstimatedTime(candidates[j-1], s.cfg.PageSize) {
 				candidates[j], candidates[j-1] = candidates[j-1], candidates[j]
 			}
 		}
@@ -147,4 +157,14 @@ func (s *Scheduler) hedgeDelay(best Source) time.Duration {
 		d = time.Millisecond
 	}
 	return d
+}
+
+// EstimatedTime computes the expected time to fetch `bytes` from a source.
+func EstimatedTime(s Source, bytes int) time.Duration {
+	bw := s.Bandwidth()
+	if bw <= 0 {
+		return s.Latency() + time.Duration(math.MaxInt64/2)
+	}
+	transferTime := time.Duration(float64(bytes) / bw * float64(time.Second))
+	return s.Latency() + transferTime
 }

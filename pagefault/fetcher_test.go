@@ -1,4 +1,4 @@
-package prefetch
+package pagefault
 
 import (
 	"bytes"
@@ -85,15 +85,15 @@ func (c *mockCache) Has(pageNo int64) bool {
 	return ok
 }
 
-func TestPrefetcher_BasicGetPage(t *testing.T) {
+func TestFetcher_BasicGetPage(t *testing.T) {
 	src := newMockSource(map[int64][]byte{
 		0: bytes.Repeat([]byte{0xAA}, 4096),
 		1: bytes.Repeat([]byte{0xBB}, 4096),
 	})
 	cache := newMockCache()
-	p := New(src, cache)
+	f := New(src, cache)
 
-	data, err := p.GetPage(context.Background(), 0)
+	data, err := f.GetPage(context.Background(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,28 +105,25 @@ func TestPrefetcher_BasicGetPage(t *testing.T) {
 	}
 }
 
-func TestPrefetcher_DeduplicatesConcurrent(t *testing.T) {
-	// Test the in-flight dedup path deterministically:
-	// pre-register an in-flight future, then verify GetPage finds it
-	// and returns the future's data without calling the source.
+func TestFetcher_DeduplicatesConcurrent(t *testing.T) {
 	src := newMockSource(map[int64][]byte{
 		0: bytes.Repeat([]byte{0xFF}, 4096),
 	})
 	cache := newMockCache()
-	p := New(src, cache)
+	f := New(src, cache)
 
 	// Pre-register an in-flight future for page 0.
-	f := &pageFuture{done: make(chan struct{})}
-	p.mu.Lock()
-	p.inflight[0] = f
-	p.mu.Unlock()
+	fut := &pageFuture{done: make(chan struct{})}
+	f.mu.Lock()
+	f.inflight[0] = fut
+	f.mu.Unlock()
 
-	// Complete the future with known data (simulates another goroutine's fetch).
-	f.data = bytes.Repeat([]byte{0xAA}, 4096)
-	close(f.done)
+	// Complete the future with known data.
+	fut.data = bytes.Repeat([]byte{0xAA}, 4096)
+	close(fut.done)
 
 	// GetPage should find the future and return its data without calling source.
-	data, err := p.GetPage(context.Background(), 0)
+	data, err := f.GetPage(context.Background(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,16 +134,12 @@ func TestPrefetcher_DeduplicatesConcurrent(t *testing.T) {
 		t.Fatalf("expected 0 source calls (used in-flight future), got %d", src.calls.Load())
 	}
 
-	// Also verify: a NEW request after the future is completed should go to source
-	// (the future was not deleted from inflight, so this tests the path where
-	// a second request arrives after the first completed but before cleanup).
-	// In real usage, the creator deletes the future, so subsequent requests
-	// create new futures.
-	p.mu.Lock()
-	delete(p.inflight, int64(0)) // simulate creator cleanup
-	p.mu.Unlock()
+	// Cleanup and verify new request goes to source.
+	f.mu.Lock()
+	delete(f.inflight, int64(0))
+	f.mu.Unlock()
 
-	data2, err := p.GetPage(context.Background(), 0)
+	data2, err := f.GetPage(context.Background(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +151,7 @@ func TestPrefetcher_DeduplicatesConcurrent(t *testing.T) {
 	}
 }
 
-func TestPrefetcher_ContextCancellation(t *testing.T) {
+func TestFetcher_ContextCancellation(t *testing.T) {
 	delay := make(chan struct{})
 	src := newMockSource(map[int64][]byte{
 		0: bytes.Repeat([]byte{0xAA}, 4096),
@@ -166,40 +159,131 @@ func TestPrefetcher_ContextCancellation(t *testing.T) {
 	src.delays = map[int64]chan struct{}{0: delay}
 
 	cache := newMockCache()
-	p := New(src, cache)
+	f := New(src, cache)
 
-	// Start a fetch that will block on the delay.
+	// Start a fetch that will block.
 	go func() {
-		p.GetPage(context.Background(), 0)
+		f.GetPage(context.Background(), 0)
 	}()
-
-	// Wait until the source fetch has started (future is registered).
 	<-src.entered
 
-	// Second caller with a cancelled context should return ctx.Err().
+	// Second caller with cancelled context.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := p.GetPage(ctx, 0)
+	_, err := f.GetPage(ctx, 0)
 	if err != context.Canceled {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 
-	close(delay) // clean up
+	close(delay)
 }
 
-func TestPrefetcher_PopulatesCacheAfterFetch(t *testing.T) {
+func TestFetcher_PopulatesCacheAfterFetch(t *testing.T) {
 	src := newMockSource(map[int64][]byte{
 		3: bytes.Repeat([]byte{0xDD}, 4096),
 	})
 	cache := newMockCache()
-	p := New(src, cache)
+	f := New(src, cache)
 
-	_, err := p.GetPage(context.Background(), 3)
+	_, err := f.GetPage(context.Background(), 3)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if _, ok := cache.Get(3); !ok {
 		t.Fatal("expected page 3 to be in cache after fetch")
+	}
+}
+
+// mockObserver records observer calls for testing.
+type mockObserver struct {
+	mu       sync.Mutex
+	accesses []int64
+	fetches  []int64
+}
+
+func (o *mockObserver) OnAccess(pageNo int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.accesses = append(o.accesses, pageNo)
+}
+
+func (o *mockObserver) OnFetch(pageNo int64, data []byte) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.fetches = append(o.fetches, pageNo)
+}
+
+func TestFetcher_ObserverNotifications(t *testing.T) {
+	src := newMockSource(map[int64][]byte{
+		5: bytes.Repeat([]byte{0xAA}, 4096),
+	})
+	cache := newMockCache()
+	f := New(src, cache)
+	obs := &mockObserver{}
+	f.SetObserver(obs)
+
+	// GetPage should trigger OnAccess and OnFetch.
+	_, err := f.GetPage(context.Background(), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.accesses) != 1 || obs.accesses[0] != 5 {
+		t.Fatalf("expected OnAccess(5), got %v", obs.accesses)
+	}
+	if len(obs.fetches) != 1 || obs.fetches[0] != 5 {
+		t.Fatalf("expected OnFetch(5), got %v", obs.fetches)
+	}
+}
+
+func TestFetcher_PrefetchSkipsOnAccess(t *testing.T) {
+	src := newMockSource(map[int64][]byte{
+		5: bytes.Repeat([]byte{0xAA}, 4096),
+	})
+	cache := newMockCache()
+	f := New(src, cache)
+	obs := &mockObserver{}
+	f.SetObserver(obs)
+
+	// Prefetch should NOT trigger OnAccess, but should trigger OnFetch.
+	_, err := f.Prefetch(context.Background(), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.accesses) != 0 {
+		t.Fatalf("expected no OnAccess for Prefetch, got %v", obs.accesses)
+	}
+	if len(obs.fetches) != 1 || obs.fetches[0] != 5 {
+		t.Fatalf("expected OnFetch(5), got %v", obs.fetches)
+	}
+
+	// Should be cached as prefetched.
+	if _, ok := cache.Get(5); !ok {
+		t.Fatal("expected page 5 to be cached")
+	}
+}
+
+func TestFetcher_NotifyRead(t *testing.T) {
+	src := newMockSource(nil)
+	cache := newMockCache()
+	f := New(src, cache)
+	obs := &mockObserver{}
+	f.SetObserver(obs)
+
+	f.NotifyRead(42, make([]byte, 4096))
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.accesses) != 1 || obs.accesses[0] != 42 {
+		t.Fatalf("expected OnAccess(42), got %v", obs.accesses)
+	}
+	if len(obs.fetches) != 1 || obs.fetches[0] != 42 {
+		t.Fatalf("expected OnFetch(42), got %v", obs.fetches)
 	}
 }

@@ -5,6 +5,9 @@ import (
 	"encoding/binary"
 	"sync"
 	"sync/atomic"
+
+	"github.com/wjordan/sqlite-prefetch/pagefault"
+	"github.com/wjordan/sqlite-prefetch/sqlitebtree"
 )
 
 // ReadaheadConfig controls the ReadaheadEngine parameters.
@@ -23,11 +26,13 @@ func (c *ReadaheadConfig) withDefaults() {
 // accesses under the same B-tree parent (analogous to Linux kernel
 // ondemand_readahead), then prefetches remaining siblings. Point selects
 // that touch only a single child trigger no prefetch.
+//
+// ReadaheadEngine implements pagefault.FetchObserver.
 type ReadaheadEngine struct {
-	mu         sync.Mutex
-	btree      *btreeTracker
-	prefetcher *Prefetcher
-	cache      PageCache
+	mu      sync.Mutex
+	btree   *sqlitebtree.Tracker
+	fetcher *pagefault.Fetcher
+	cache   pagefault.PageCache
 
 	// Scan detection: tracks last accessed page's parent and child index.
 	scanParent uint32
@@ -43,51 +48,42 @@ type ReadaheadEngine struct {
 	statPages       atomic.Int64 // total pages submitted for prefetch
 	statSkipped     atomic.Int64 // pages skipped (already in cache)
 	statBtreeHits   atomic.Int64 // scan detections that triggered B-tree prefetch
-	statBtreeParsed atomic.Int64 // interior pages successfully parsed by OnFetchComplete
+	statBtreeParsed atomic.Int64 // interior pages successfully parsed by OnFetch
 	statOverflowHit atomic.Int64 // overflow pages prefetched via cascading
 }
 
+// Compile-time check that ReadaheadEngine satisfies pagefault.FetchObserver.
+var _ pagefault.FetchObserver = (*ReadaheadEngine)(nil)
+
 // NewReadaheadEngine creates a ReadaheadEngine.
 func NewReadaheadEngine(
-	prefetcher *Prefetcher,
-	cache PageCache,
+	fetcher *pagefault.Fetcher,
+	cache pagefault.PageCache,
 	cfg ReadaheadConfig,
 ) *ReadaheadEngine {
 	cfg.withDefaults()
 	return &ReadaheadEngine{
-		btree:       newBtreeTracker(1024),
+		btree:       sqlitebtree.NewTracker(1024),
 		overflowSet: make(map[uint32]bool),
-		prefetcher:  prefetcher,
+		fetcher:     fetcher,
 		cache:       cache,
 		workerSem:   make(chan struct{}, cfg.Workers),
 		scanIdx:     -1,
 	}
 }
 
-// OnPageAccess is called on every page read (fault or cache hit) to detect
+// OnAccess is called on every page read (fault or cache hit) to detect
 // scans. Two consecutive sibling accesses under the same B-tree parent
 // trigger prefetch of remaining siblings.
-func (r *ReadaheadEngine) OnPageAccess(pageNo int64) {
+//
+// Implements pagefault.FetchObserver.
+func (r *ReadaheadEngine) OnAccess(pageNo int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	pg := uint32(pageNo)
-	parent, ok := r.btree.childToParent[pg]
+	parent, idx, ok := r.btree.ChildPosition(pg)
 	if !ok {
-		r.scanParent = 0
-		r.scanIdx = -1
-		return
-	}
-
-	children := r.btree.interiorChildren[parent]
-	idx := -1
-	for i, c := range children {
-		if c == pg {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
 		r.scanParent = 0
 		r.scanIdx = -1
 		return
@@ -96,7 +92,7 @@ func (r *ReadaheadEngine) OnPageAccess(pageNo int64) {
 	// Two consecutive siblings under the same parent → scan detected.
 	if parent == r.scanParent && idx == r.scanIdx+1 {
 		pages, result := r.btree.Predict(pg)
-		if result == PredictOK && len(pages) > 0 {
+		if result == sqlitebtree.PredictOK && len(pages) > 0 {
 			int64Pages := make([]int64, len(pages))
 			for i, p := range pages {
 				int64Pages[i] = int64(p)
@@ -110,9 +106,8 @@ func (r *ReadaheadEngine) OnPageAccess(pageNo int64) {
 	r.scanIdx = idx
 }
 
-// OnFetchComplete inspects fetched page data for structure that enables
-// prefetching. Called from Prefetcher.getPageInternal after every successful
-// fetch, and from Prefetcher.NotifyPageRead for cache-hit pages.
+// OnFetch inspects fetched page data for structure that enables prefetching.
+// Called after every successful fetch.
 //
 // Processing order:
 //  1. Overflow set check (overflow pages have no flag byte — first 4 bytes
@@ -121,7 +116,9 @@ func (r *ReadaheadEngine) OnPageAccess(pageNo int64) {
 //  2. Flag byte check:
 //     - 0x05 or 0x02: interior page → parse for btree tracking
 //     - 0x0D: leaf table page → extract first overflow page numbers
-func (r *ReadaheadEngine) OnFetchComplete(pageNo int64, data []byte) {
+//
+// Implements pagefault.FetchObserver.
+func (r *ReadaheadEngine) OnFetch(pageNo int64, data []byte) {
 	if len(data) < 8 {
 		return
 	}
@@ -158,15 +155,12 @@ func (r *ReadaheadEngine) OnFetchComplete(pageNo int64, data []byte) {
 
 	switch flag {
 	case 0x05, 0x02: // interior table or index page
-		prevCount := len(r.btree.interiorChildren)
 		r.btree.OnFetchComplete(uint32(pageNo), data)
-		if len(r.btree.interiorChildren) > prevCount {
-			r.statBtreeParsed.Add(1)
-		}
+		r.statBtreeParsed.Add(1)
 
 	case 0x0D: // leaf table page — extract overflow pointers
 		sqlitePgno := uint32(pageNo) + 1 // convert to 1-based
-		overflows := parseLeafTableOverflows(data, sqlitePgno)
+		overflows := sqlitebtree.ParseLeafTableOverflows(data, sqlitePgno)
 		if len(overflows) > 0 {
 			var pages []int64
 			for _, ovfl := range overflows {
@@ -196,7 +190,7 @@ func (r *ReadaheadEngine) submitBatch(pages []int64) {
 		r.workerSem <- struct{}{} // acquire
 		go func(pn int64) {
 			defer func() { <-r.workerSem }()
-			r.prefetcher.getPageInternal(context.Background(), pn, true)
+			r.fetcher.Prefetch(context.Background(), pn)
 		}(pg)
 	}
 	r.statPages.Add(fetched)

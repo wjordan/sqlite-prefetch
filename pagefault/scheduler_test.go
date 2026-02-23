@@ -1,4 +1,4 @@
-package prefetch
+package pagefault
 
 import (
 	"context"
@@ -12,7 +12,6 @@ func TestScheduler_SingleSource(t *testing.T) {
 		name:      "s3",
 		latency:   50 * time.Millisecond,
 		bandwidth: 100 * 1024 * 1024,
-		complete:  1.0,
 		getPage: func(_ context.Context, pageNo int64) ([]byte, error) {
 			data := make([]byte, 4096)
 			data[0] = 0xAB
@@ -40,11 +39,9 @@ func TestScheduler_HedgedRequest_FastWins(t *testing.T) {
 		name:      "peer",
 		latency:   2 * time.Millisecond,
 		bandwidth: 500 * 1024 * 1024,
-		complete:  0.8,
 		getPage: func(_ context.Context, _ int64) ([]byte, error) {
-			// Peer responds quickly.
 			data := make([]byte, 4096)
-			data[0] = 0x01 // peer marker
+			data[0] = 0x01
 			return data, nil
 		},
 	}
@@ -52,12 +49,10 @@ func TestScheduler_HedgedRequest_FastWins(t *testing.T) {
 		name:      "s3",
 		latency:   50 * time.Millisecond,
 		bandwidth: 100 * 1024 * 1024,
-		complete:  1.0,
 		getPage: func(_ context.Context, _ int64) ([]byte, error) {
-			// S3 is much slower.
 			time.Sleep(20 * time.Millisecond)
 			data := make([]byte, 4096)
-			data[0] = 0x02 // s3 marker
+			data[0] = 0x02
 			return data, nil
 		},
 	}
@@ -79,8 +74,7 @@ func TestScheduler_FallbackOnPeerMiss(t *testing.T) {
 		name:      "peer",
 		latency:   2 * time.Millisecond,
 		bandwidth: 500 * 1024 * 1024,
-		complete:  0.5,
-		hasPage:   func(_ int64) bool { return false }, // Peer doesn't have it.
+		hasPage:   func(_ int64) bool { return false },
 		getPage: func(_ context.Context, _ int64) ([]byte, error) {
 			t.Fatal("peer.GetPage should not be called")
 			return nil, nil
@@ -90,7 +84,6 @@ func TestScheduler_FallbackOnPeerMiss(t *testing.T) {
 		name:      "s3",
 		latency:   50 * time.Millisecond,
 		bandwidth: 100 * 1024 * 1024,
-		complete:  1.0,
 		getPage: func(_ context.Context, _ int64) ([]byte, error) {
 			data := make([]byte, 4096)
 			data[0] = 0x02
@@ -112,13 +105,11 @@ func TestScheduler_FallbackOnPeerMiss(t *testing.T) {
 
 func TestScheduler_NoSources(t *testing.T) {
 	sched := NewScheduler(SchedulerConfig{})
-	// No sources set at all.
 	_, err := sched.Fetch(context.Background(), 1)
 	if err == nil {
 		t.Fatal("expected error for no sources")
 	}
 
-	// Sources set but none have the page.
 	sched.SetSources([]Source{
 		&staticSource{
 			name:    "peer",
@@ -136,7 +127,6 @@ func TestScheduler_PeerErrorFallsBackToS3(t *testing.T) {
 		name:      "peer",
 		latency:   2 * time.Millisecond,
 		bandwidth: 500 * 1024 * 1024,
-		complete:  0.8,
 		getPage: func(_ context.Context, _ int64) ([]byte, error) {
 			return nil, fmt.Errorf("peer: connection refused")
 		},
@@ -145,7 +135,6 @@ func TestScheduler_PeerErrorFallsBackToS3(t *testing.T) {
 		name:      "s3",
 		latency:   50 * time.Millisecond,
 		bandwidth: 100 * 1024 * 1024,
-		complete:  1.0,
 		getPage: func(_ context.Context, _ int64) ([]byte, error) {
 			data := make([]byte, 4096)
 			data[0] = 0x02
@@ -153,7 +142,6 @@ func TestScheduler_PeerErrorFallsBackToS3(t *testing.T) {
 		},
 	}
 
-	// Short hedge delay so fallback starts quickly after peer error.
 	sched := NewScheduler(SchedulerConfig{HedgeDelay: 1 * time.Millisecond})
 	sched.SetSources([]Source{peer, s3})
 

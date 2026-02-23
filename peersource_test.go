@@ -21,13 +21,6 @@ func TestPeerSource_Properties(t *testing.T) {
 	if got := ps.Addr(); got != "10.0.0.2:9001" {
 		t.Fatalf("Addr() = %q, want %q", got, "10.0.0.2:9001")
 	}
-	if got := ps.EgressCost(); got != 0 {
-		t.Fatalf("EgressCost() = %f, want 0", got)
-	}
-	if got := ps.Completeness(); got != 0.5 {
-		t.Fatalf("Completeness() = %f, want 0.5", got)
-	}
-
 	// Router-based page checks.
 	if !ps.HasPage(1) {
 		t.Fatal("HasPage(1) = false, want true")

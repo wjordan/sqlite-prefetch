@@ -4,6 +4,9 @@ import (
 	"context"
 	"math/rand"
 	"testing"
+
+	"github.com/wjordan/sqlite-prefetch/pagefault"
+	"github.com/wjordan/sqlite-prefetch/sqlitebtree"
 )
 
 // --- Unit tests ---
@@ -39,13 +42,13 @@ func TestPeerRouter_RecordMiss(t *testing.T) {
 
 func TestPeerRouter_SiblingExpansion(t *testing.T) {
 	// Build a readahead engine with a btreeTracker that has an interior page.
-	pf := New(&nullSource{}, &nullCache{})
+	pf := pagefault.New(&nullSource{}, &nullCache{})
 	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
 
 	// Feed an interior page: 1-based [11, 21, 31, 41, 51] → 0-based [10, 20, 30, 40, 50].
 	children := []uint32{11, 21, 31, 41, 51}
-	page := buildInteriorTablePage(4096, children)
-	re.OnFetchComplete(2, page) // 0-based page 2
+	page := sqlitebtree.BuildInteriorTablePage(4096, children)
+	re.OnFetch(2, page) // 0-based page 2
 
 	r := NewPeerRouter(re)
 	r.RecordResult("peerA", 10, true)
@@ -269,7 +272,7 @@ type routingMetrics struct {
 
 func runWithPeerRouter(sc routingScenario) routingMetrics {
 	// Build readahead engine with btree structure.
-	pf := New(&nullSource{}, &nullCache{})
+	pf := pagefault.New(&nullSource{}, &nullCache{})
 	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
 
 	// Feed interior pages.
@@ -279,8 +282,8 @@ func runWithPeerRouter(sc routingScenario) routingMetrics {
 		for i, c := range children {
 			oneBased[i] = c + 1
 		}
-		page := buildInteriorTablePage(4096, oneBased)
-		re.OnFetchComplete(int64(interiorPgno), page)
+		page := sqlitebtree.BuildInteriorTablePage(4096, oneBased)
+		re.OnFetch(int64(interiorPgno), page)
 	}
 
 	router := NewPeerRouter(re)
@@ -621,15 +624,15 @@ func TestRoutingScenario_BtreeAmplification(t *testing.T) {
 	// After 5 faults, router should know about all 500 pages via sibling expansion.
 	// Verify by checking subsequent pages route correctly.
 	// Build readahead engine with structure.
-	pf := New(&nullSource{}, &nullCache{})
+	pf := pagefault.New(&nullSource{}, &nullCache{})
 	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
 	for interiorPgno, children := range btree {
 		oneBased := make([]uint32, len(children))
 		for i, c := range children {
 			oneBased[i] = c + 1
 		}
-		page := buildInteriorTablePage(4096, oneBased)
-		re.OnFetchComplete(int64(interiorPgno), page)
+		page := sqlitebtree.BuildInteriorTablePage(4096, oneBased)
+		re.OnFetch(int64(interiorPgno), page)
 	}
 	router2 := NewPeerRouter(re)
 	router2.mu.Lock()
@@ -658,7 +661,7 @@ func TestRoutingScenario_PeerDeparture(t *testing.T) {
 		peerBPages[i] = true
 	}
 
-	pf := New(&nullSource{}, &nullCache{})
+	pf := pagefault.New(&nullSource{}, &nullCache{})
 	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
 	router := NewPeerRouter(re)
 
@@ -731,7 +734,7 @@ func TestRoutingScenario_LeaderAwareColdStart(t *testing.T) {
 		noLeader.hitRate, noLeader.peerMisses, noLeader.s3Fallbacks)
 
 	// With leader hint: build a custom simulation.
-	pf := New(&nullSource{}, &nullCache{})
+	pf := pagefault.New(&nullSource{}, &nullCache{})
 	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
 	router := NewPeerRouter(re)
 	router.SetLeader("leader")

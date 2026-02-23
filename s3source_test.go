@@ -3,9 +3,36 @@ package prefetch
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/wjordan/sqlite-prefetch/pagefault"
 )
+
+// mockSource is an in-memory PageSource for testing.
+type mockSource struct {
+	pages map[int64][]byte
+	calls atomic.Int64
+}
+
+func newMockSource(pages map[int64][]byte) *mockSource {
+	if pages == nil {
+		pages = make(map[int64][]byte)
+	}
+	return &mockSource{pages: pages}
+}
+
+func (m *mockSource) GetPage(_ context.Context, pageNo int64) ([]byte, error) {
+	m.calls.Add(1)
+	if d, ok := m.pages[pageNo]; ok {
+		cp := make([]byte, len(d))
+		copy(cp, d)
+		return cp, nil
+	}
+	return nil, fmt.Errorf("page %d not found", pageNo)
+}
 
 func TestS3Source_Properties(t *testing.T) {
 	src := newMockSource(map[int64][]byte{
@@ -16,17 +43,11 @@ func TestS3Source_Properties(t *testing.T) {
 	if s.Name() != "s3" {
 		t.Fatalf("Name() = %q, want %q", s.Name(), "s3")
 	}
-	if s.Completeness() != 1.0 {
-		t.Fatalf("Completeness() = %f, want 1.0", s.Completeness())
-	}
 	if !s.HasPage(42) {
 		t.Fatal("HasPage(42) = false, want true")
 	}
 	if !s.HasPage(999) {
 		t.Fatal("HasPage(999) = false, want true (S3 has all pages)")
-	}
-	if s.EgressCost() <= 0 {
-		t.Fatalf("EgressCost() = %e, want > 0", s.EgressCost())
 	}
 	// Default latency should be ~50ms.
 	if s.Latency() < 40*time.Millisecond || s.Latency() > 60*time.Millisecond {
@@ -101,11 +122,6 @@ func TestS3Source_DefaultConfig(t *testing.T) {
 	cfg := S3SourceConfig{}
 	cfg.withDefaults()
 
-	// EgressCostPerByte should be $0.09/GB.
-	expectedCost := 0.09 / (1024 * 1024 * 1024)
-	if cfg.EgressCostPerByte != expectedCost {
-		t.Fatalf("EgressCostPerByte = %e, want %e", cfg.EgressCostPerByte, expectedCost)
-	}
 	if cfg.DefaultLatency != 50*time.Millisecond {
 		t.Fatalf("DefaultLatency = %v, want 50ms", cfg.DefaultLatency)
 	}
@@ -122,16 +138,12 @@ func TestS3Source_CustomConfig(t *testing.T) {
 		1: bytes.Repeat([]byte{0xAA}, 4096),
 	})
 	cfg := S3SourceConfig{
-		EgressCostPerByte: 0.05 / (1024 * 1024 * 1024),
-		DefaultLatency:    100 * time.Millisecond,
-		DefaultBandwidth:  200 * 1024 * 1024,
-		EWMAAlpha:         0.5,
+		DefaultLatency:   100 * time.Millisecond,
+		DefaultBandwidth: 200 * 1024 * 1024,
+		EWMAAlpha:        0.5,
 	}
 	s := NewS3Source(src, cfg)
 
-	if s.EgressCost() != cfg.EgressCostPerByte {
-		t.Fatalf("EgressCost() = %e, want %e", s.EgressCost(), cfg.EgressCostPerByte)
-	}
 	// Initial latency should reflect the custom default.
 	if s.Latency() < 90*time.Millisecond || s.Latency() > 110*time.Millisecond {
 		t.Fatalf("Latency() = %v, want ~100ms", s.Latency())
@@ -142,5 +154,5 @@ func TestS3Source_ImplementsSource(t *testing.T) {
 	src := newMockSource(nil)
 	s := NewS3Source(src, S3SourceConfig{})
 	// Verify the interface is satisfied at the type level.
-	var _ Source = s
+	var _ pagefault.Source = s
 }
