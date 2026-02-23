@@ -38,11 +38,7 @@ func EncodeSnapshot(pages []PageAvailability) []byte {
 		off += 4
 		binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(pa.Extents)))
 		off += 2
-		for _, ext := range pa.Extents {
-			binary.BigEndian.PutUint16(buf[off:off+2], ext.Start)
-			binary.BigEndian.PutUint16(buf[off+2:off+4], ext.Count)
-			off += 4
-		}
+		off = encodeExtents(buf, off, pa.Extents)
 	}
 	return buf
 }
@@ -70,15 +66,11 @@ func DecodeSnapshot(data []byte) ([]PageAvailability, error) {
 		numExtents := binary.BigEndian.Uint16(data[off : off+2])
 		off += 2
 
-		extents := make([]ChildExtent, numExtents)
-		for j := range extents {
-			if off+4 > len(data) {
-				return nil, errors.New("snapshot: truncated extent")
-			}
-			extents[j].Start = binary.BigEndian.Uint16(data[off : off+2])
-			extents[j].Count = binary.BigEndian.Uint16(data[off+2 : off+4])
-			off += 4
+		extents, newOff, err := decodeExtents(data, off, numExtents, "snapshot")
+		if err != nil {
+			return nil, err
 		}
+		off = newOff
 		pages = append(pages, PageAvailability{
 			InteriorPage: interiorPage,
 			Extents:      extents,
@@ -99,12 +91,7 @@ func EncodeDelta(delta AvailabilityDelta) []byte {
 	buf[6] = byte(delta.Op)
 	binary.BigEndian.PutUint16(buf[7:9], uint16(len(delta.Extents)))
 
-	off := 9
-	for _, ext := range delta.Extents {
-		binary.BigEndian.PutUint16(buf[off:off+2], ext.Start)
-		binary.BigEndian.PutUint16(buf[off+2:off+4], ext.Count)
-		off += 4
-	}
+	encodeExtents(buf, 9, delta.Extents)
 	return buf
 }
 
@@ -124,15 +111,34 @@ func DecodeDelta(data []byte) (AvailabilityDelta, error) {
 	}
 
 	numExtents := binary.BigEndian.Uint16(data[7:9])
-	off := 9
-	delta.Extents = make([]ChildExtent, numExtents)
-	for i := range delta.Extents {
-		if off+4 > len(data) {
-			return AvailabilityDelta{}, errors.New("delta: truncated extent")
-		}
-		delta.Extents[i].Start = binary.BigEndian.Uint16(data[off : off+2])
-		delta.Extents[i].Count = binary.BigEndian.Uint16(data[off+2 : off+4])
+	extents, _, err := decodeExtents(data, 9, numExtents, "delta")
+	if err != nil {
+		return AvailabilityDelta{}, err
+	}
+	delta.Extents = extents
+	return delta, nil
+}
+
+// encodeExtents writes extents as [2B start][2B count] pairs into buf at off.
+func encodeExtents(buf []byte, off int, extents []ChildExtent) int {
+	for _, ext := range extents {
+		binary.BigEndian.PutUint16(buf[off:off+2], ext.Start)
+		binary.BigEndian.PutUint16(buf[off+2:off+4], ext.Count)
 		off += 4
 	}
-	return delta, nil
+	return off
+}
+
+// decodeExtents reads n extents as [2B start][2B count] pairs from data at off.
+func decodeExtents(data []byte, off int, n uint16, label string) ([]ChildExtent, int, error) {
+	extents := make([]ChildExtent, n)
+	for i := range extents {
+		if off+4 > len(data) {
+			return nil, off, fmt.Errorf("%s: truncated extent", label)
+		}
+		extents[i].Start = binary.BigEndian.Uint16(data[off : off+2])
+		extents[i].Count = binary.BigEndian.Uint16(data[off+2 : off+4])
+		off += 4
+	}
+	return extents, off, nil
 }

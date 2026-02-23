@@ -1,6 +1,9 @@
 package prefetch
 
-import "sync"
+import (
+	"slices"
+	"sync"
+)
 
 // ChildExtent represents a contiguous range of children within an interior
 // page's child array. Start is 0-based index, Count is the number of
@@ -178,24 +181,14 @@ func (a *AvailabilityIndex) addExtents(peerID string, interiorPage uint32, exten
 func (a *AvailabilityIndex) removeExtents(peerID string, interiorPage uint32, extents []ChildExtent) {
 	// Unresolve the child pages for these extents.
 	if a.parsedInteriors[interiorPage] {
-		children, ok := a.lookup.Children(interiorPage)
-		if ok {
-			for _, ext := range extents {
-				start := int(ext.Start)
-				end := start + int(ext.Count)
-				if end > len(children) {
-					end = len(children)
-				}
-				for i := start; i < end; i++ {
-					if peers, exists := a.resolved[children[i]]; exists {
-						delete(peers, peerID)
-						if len(peers) == 0 {
-							delete(a.resolved, children[i])
-						}
-					}
+		a.forEachChild(interiorPage, extents, func(childPage uint32) {
+			if peers, exists := a.resolved[childPage]; exists {
+				delete(peers, peerID)
+				if len(peers) == 0 {
+					delete(a.resolved, childPage)
 				}
 			}
-		}
+		})
 	}
 
 	// Remove from opaque extents.
@@ -210,11 +203,23 @@ func (a *AvailabilityIndex) removeExtents(peerID string, interiorPage uint32, ex
 // resolveExtents maps child-index extents to physical page numbers and adds
 // them to the resolved layer. Caller must hold a.mu.
 func (a *AvailabilityIndex) resolveExtents(peerID string, interiorPage uint32, extents []ChildExtent) {
+	a.forEachChild(interiorPage, extents, func(childPage uint32) {
+		peers, exists := a.resolved[childPage]
+		if !exists {
+			peers = make(map[string]struct{})
+			a.resolved[childPage] = peers
+		}
+		peers[peerID] = struct{}{}
+	})
+}
+
+// forEachChild iterates over child page numbers covered by the given extents
+// for an interior page. Caller must hold a.mu.
+func (a *AvailabilityIndex) forEachChild(interiorPage uint32, extents []ChildExtent, fn func(childPage uint32)) {
 	children, ok := a.lookup.Children(interiorPage)
 	if !ok {
 		return
 	}
-
 	for _, ext := range extents {
 		start := int(ext.Start)
 		end := start + int(ext.Count)
@@ -222,13 +227,7 @@ func (a *AvailabilityIndex) resolveExtents(peerID string, interiorPage uint32, e
 			end = len(children)
 		}
 		for i := start; i < end; i++ {
-			childPage := children[i]
-			peers, exists := a.resolved[childPage]
-			if !exists {
-				peers = make(map[string]struct{})
-				a.resolved[childPage] = peers
-			}
-			peers[peerID] = struct{}{}
+			fn(children[i])
 		}
 	}
 }
@@ -386,12 +385,7 @@ func (l *LocalAvailability) buildExtents(interiorPage uint32) []ChildExtent {
 	for idx := range pages {
 		sorted = append(sorted, idx)
 	}
-	// Simple insertion sort (typically small).
-	for i := 1; i < len(sorted); i++ {
-		for j := i; j > 0 && sorted[j] < sorted[j-1]; j-- {
-			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
-		}
-	}
+	slices.Sort(sorted)
 
 	// Compact into contiguous extents.
 	var extents []ChildExtent
