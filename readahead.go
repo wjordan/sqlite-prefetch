@@ -34,6 +34,9 @@ type ReadaheadEngine struct {
 	fetcher *pagefault.Fetcher
 	cache   pagefault.PageCache
 
+	// Optional callback invoked after every successful fetch with the 0-based page number.
+	onPageFetched func(uint32)
+
 	// Scan detection: tracks last accessed page's parent and child index.
 	scanParent uint32
 	scanIdx    int
@@ -70,6 +73,14 @@ func NewReadaheadEngine(
 		workerSem:   make(chan struct{}, cfg.Workers),
 		scanIdx:     -1,
 	}
+}
+
+// SetOnPageFetched sets a callback invoked after every successful fetch
+// with the 0-based page number. Optional (nil-safe).
+func (r *ReadaheadEngine) SetOnPageFetched(fn func(uint32)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onPageFetched = fn
 }
 
 // OnAccess is called on every page read (fault or cache hit) to detect
@@ -124,8 +135,17 @@ func (r *ReadaheadEngine) OnFetch(pageNo int64, data []byte) {
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.onFetchLocked(pageNo, data)
+	r.mu.Unlock()
 
+	// Notify caller OUTSIDE the lock.
+	if r.onPageFetched != nil {
+		r.onPageFetched(uint32(pageNo))
+	}
+}
+
+// onFetchLocked performs the lock-held portion of OnFetch.
+func (r *ReadaheadEngine) onFetchLocked(pageNo int64, data []byte) {
 	// 1. Check if this is a known overflow page.
 	if r.overflowSet[uint32(pageNo)] {
 		delete(r.overflowSet, uint32(pageNo))
@@ -229,12 +249,9 @@ func (r *ReadaheadEngine) ResetStats() {
 	r.statOverflowHit.Store(0)
 }
 
-// Siblings returns all children of pageNo's parent via the btreeTracker.
-// Thread-safe: acquires r.mu and returns a copy.
-func (r *ReadaheadEngine) Siblings(pageNo uint32) []uint32 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.btree.Siblings(pageNo)
+// Btree returns the underlying B-tree tracker.
+func (r *ReadaheadEngine) Btree() *sqlitebtree.Tracker {
+	return r.btree
 }
 
 // Reset clears all pattern state. Called on rebase when the page layout

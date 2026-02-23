@@ -217,40 +217,6 @@ func TestParseLeafTableOverflows_NotLeafTable(t *testing.T) {
 	}
 }
 
-func TestTracker_Siblings(t *testing.T) {
-	bt := NewTracker(1024)
-	// 1-based [11, 21, 31, 41, 51] → 0-based [10, 20, 30, 40, 50]
-	children := []uint32{11, 21, 31, 41, 51}
-	page := BuildInteriorTablePage(4096, children)
-	bt.OnFetchComplete(2, page)
-
-	// Siblings of any child should return all children.
-	sibs := bt.Siblings(20)
-	if len(sibs) != 5 {
-		t.Fatalf("expected 5 siblings, got %d", len(sibs))
-	}
-	want := []uint32{10, 20, 30, 40, 50}
-	for i, s := range sibs {
-		if s != want[i] {
-			t.Errorf("sibling[%d] = %d, want %d", i, s, want[i])
-		}
-	}
-
-	// First child also returns all siblings.
-	sibs = bt.Siblings(10)
-	if len(sibs) != 5 {
-		t.Fatalf("expected 5 siblings for first child, got %d", len(sibs))
-	}
-}
-
-func TestTracker_Siblings_Unknown(t *testing.T) {
-	bt := NewTracker(1024)
-	sibs := bt.Siblings(999)
-	if sibs != nil {
-		t.Fatalf("expected nil for unknown page, got %v", sibs)
-	}
-}
-
 func TestTracker_PredictSiblings(t *testing.T) {
 	bt := NewTracker(1024)
 	// Page data contains 1-based SQLite pgno values; OnFetchComplete converts
@@ -440,6 +406,41 @@ func TestTracker_LookaheadLastInterior(t *testing.T) {
 	// Should just have leaf 51, no lookahead.
 	if len(pages) != 1 || pages[0] != 51 {
 		t.Fatalf("got %v, want [51]", pages)
+	}
+}
+
+func TestTracker_Children(t *testing.T) {
+	bt := NewTracker(1024)
+	// 1-based [11, 21, 31] → 0-based [10, 20, 30]
+	children := []uint32{11, 21, 31}
+	page := BuildInteriorTablePage(4096, children)
+	bt.OnFetchComplete(2, page)
+
+	got, ok := bt.Children(2)
+	if !ok {
+		t.Fatal("expected ok=true for parsed interior page")
+	}
+	want := []uint32{10, 20, 30}
+	if len(got) != len(want) {
+		t.Fatalf("Children(2) returned %d children, want %d", len(got), len(want))
+	}
+	for i, c := range want {
+		if got[i] != c {
+			t.Errorf("Children(2)[%d] = %d, want %d", i, got[i], c)
+		}
+	}
+
+	// Unknown page.
+	_, ok = bt.Children(999)
+	if ok {
+		t.Fatal("expected ok=false for unknown page")
+	}
+
+	// Verify it's a copy.
+	got[0] = 9999
+	got2, _ := bt.Children(2)
+	if got2[0] == 9999 {
+		t.Fatal("Children should return a copy")
 	}
 }
 

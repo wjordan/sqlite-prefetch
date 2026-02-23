@@ -1,6 +1,6 @@
 # sqlite-prefetch
 
-A Go library for intelligently prefetching [SQLite database pages](https://www.sqlite.org/fileformat2.html#pages) from remote storage (S3, peer nodes, or any custom backend). Zero external dependencies.
+A Go library for intelligently prefetching [SQLite database pages](https://www.sqlite.org/fileformat2.html#pages) from remote storage (S3, peer nodes, or any custom backend).
 
 ## The problem
 
@@ -21,7 +21,7 @@ The library combines this B-tree prediction with scan detection, multi-source sc
 | **ReadaheadEngine** | Detects scans via two-consecutive-sibling accesses under the same B-tree parent, then prefetches remaining siblings. Point selects (single child access) trigger no prefetch. Delegates prediction to the B-tree tracker and overflow chain prefetcher. |
 | **btreeTracker** | Parses [interior B-tree pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) (table `0x05` and index `0x02`) for exact child-page prediction, with multi-level lookahead to stay ahead of SQLite's descent. |
 | **Overflow prefetcher** | Parses [leaf table pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) (`0x0D`) to find first overflow page numbers, then cascades through the linked-list chain via next-page pointers. |
-| **PeerRouter** | Learns which peer nodes cache which pages via fetch outcomes, using [EWMA](https://en.wikipedia.org/wiki/Exponential_smoothing) hit-rate tracking and B-tree sibling amplification to route requests efficiently. |
+| **AvailabilityIndex** | Tracks which pages each peer has cached as [roaring64 bitmaps](https://github.com/RoaringBitmap/roaring) over a logical address space. Enables exact routing with zero convergence time. |
 
 Each component is optional. You can use just the `Prefetcher` for deduplication, add the `Scheduler` for multi-source fetching, or enable the full stack for autonomous B-tree-aware prefetching.
 
@@ -128,13 +128,11 @@ The overflow prefetcher handles this by parsing leaf table pages (`0x0D`) when t
 
 The `Scheduler` implements [hedged requests](https://research.google/pubs/the-tail-at-scale/) from Google's "The Tail at Scale" (Dean & Barroso, 2013). It starts the best source immediately and fires a fallback after `1.5x best_latency`. The first successful response wins; the other is cancelled.
 
-### Peer routing
+### Peer availability gossip
 
-The `PeerRouter` learns which peers have which pages through fetch outcomes:
-1. **Page hints** -- on hit, record the peer for that page + all B-tree siblings
-2. **Leader routing** -- if a leader peer is set, route all unhinted pages there
-3. **[EWMA](https://en.wikipedia.org/wiki/Exponential_smoothing) hit rate** -- peers with >30% hit rate get routed to for unhinted pages
-4. **Exploration** -- 10% of unhinted requests go to random peers for discovery
+Peers exchange page availability using [roaring64 bitmaps](https://github.com/RoaringBitmap/roaring) over physical page numbers. The `AvailabilityIndex` stores one roaring64 bitmap per peer; `LocalAvailability` maintains a single bitmap for the local node. Peer removal is O(1) (delete the bitmap).
+
+Exchange uses QUIC streams (reliable full snapshots on peer join, periodic resync) and datagrams (unreliable 7-byte deltas on cache changes). Since availability is known upfront, routing achieves 100% hit rate immediately — no convergence period.
 
 ## References
 
@@ -143,7 +141,7 @@ The `PeerRouter` learns which peers have which pages through fetch outcomes:
 
 ## Dependencies
 
-Standard library only. Zero external dependencies.
+- [roaring](https://github.com/RoaringBitmap/roaring) (Apache-2.0) — compressed bitmap data structure for peer availability tracking
 
 ## License
 
