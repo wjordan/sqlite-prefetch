@@ -34,6 +34,10 @@ type ReadaheadEngine struct {
 	fetcher *pagefault.Fetcher
 	cache   pagefault.PageCache
 
+	// Availability tracking.
+	localAvail  *LocalAvailability
+	remoteAvail *AvailabilityIndex
+
 	// Scan detection: tracks last accessed page's parent and child index.
 	scanParent uint32
 	scanIdx    int
@@ -55,7 +59,9 @@ type ReadaheadEngine struct {
 // Compile-time check that ReadaheadEngine satisfies pagefault.FetchObserver.
 var _ pagefault.FetchObserver = (*ReadaheadEngine)(nil)
 
-// NewReadaheadEngine creates a ReadaheadEngine.
+// NewReadaheadEngine creates a ReadaheadEngine. The localAvail and
+// remoteAvail parameters are optional; pass nil to disable availability
+// tracking.
 func NewReadaheadEngine(
 	fetcher *pagefault.Fetcher,
 	cache pagefault.PageCache,
@@ -70,6 +76,15 @@ func NewReadaheadEngine(
 		workerSem:   make(chan struct{}, cfg.Workers),
 		scanIdx:     -1,
 	}
+}
+
+// SetAvailability sets the local and remote availability trackers. Both are
+// optional (nil-safe).
+func (r *ReadaheadEngine) SetAvailability(local *LocalAvailability, remote *AvailabilityIndex) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.localAvail = local
+	r.remoteAvail = remote
 }
 
 // OnAccess is called on every page read (fault or cache hit) to detect
@@ -126,6 +141,11 @@ func (r *ReadaheadEngine) OnFetch(pageNo int64, data []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Notify local availability that this page is now cached.
+	if r.localAvail != nil {
+		r.localAvail.OnPageCached(uint32(pageNo))
+	}
+
 	// 1. Check if this is a known overflow page.
 	if r.overflowSet[uint32(pageNo)] {
 		delete(r.overflowSet, uint32(pageNo))
@@ -157,6 +177,16 @@ func (r *ReadaheadEngine) OnFetch(pageNo int64, data []byte) {
 	case 0x05, 0x02: // interior table or index page
 		r.btree.OnFetchComplete(uint32(pageNo), data)
 		r.statBtreeParsed.Add(1)
+
+		// Notify availability trackers about the parsed interior page.
+		if children, ok := r.btree.Children(uint32(pageNo)); ok {
+			if r.localAvail != nil {
+				r.localAvail.OnInteriorPageParsed(uint32(pageNo), children)
+			}
+			if r.remoteAvail != nil {
+				r.remoteAvail.OnInteriorPageParsed(uint32(pageNo))
+			}
+		}
 
 	case 0x0D: // leaf table page — extract overflow pointers
 		sqlitePgno := uint32(pageNo) + 1 // convert to 1-based
@@ -229,12 +259,10 @@ func (r *ReadaheadEngine) ResetStats() {
 	r.statOverflowHit.Store(0)
 }
 
-// Siblings returns all children of pageNo's parent via the btreeTracker.
-// Thread-safe: acquires r.mu and returns a copy.
-func (r *ReadaheadEngine) Siblings(pageNo uint32) []uint32 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.btree.Siblings(pageNo)
+// Btree returns the underlying B-tree tracker. Used by AvailabilityIndex
+// as a ChildLookup.
+func (r *ReadaheadEngine) Btree() *sqlitebtree.Tracker {
+	return r.btree
 }
 
 // Reset clears all pattern state. Called on rebase when the page layout

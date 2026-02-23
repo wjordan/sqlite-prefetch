@@ -57,7 +57,7 @@ type PeerSource struct {
 	transport PeerTransport
 	nodeID    string
 	addr      string // peer's transport address
-	router    *PeerRouter
+	avail     *AvailabilityIndex
 	cfg       PeerSourceConfig
 	latency   *pagefault.EWMA
 	bandwidth *pagefault.EWMA
@@ -67,7 +67,7 @@ type PeerSource struct {
 var _ pagefault.Source = (*PeerSource)(nil)
 
 // NewPeerSource creates a PeerSource for the given peer.
-func NewPeerSource(t PeerTransport, nodeID, addr string, router *PeerRouter, cfg PeerSourceConfig) *PeerSource {
+func NewPeerSource(t PeerTransport, nodeID, addr string, avail *AvailabilityIndex, cfg PeerSourceConfig) *PeerSource {
 	cfg.withDefaults()
 	lat := pagefault.NewEWMA(cfg.EWMAAlpha)
 	lat.Update(float64(cfg.DefaultLatency))
@@ -77,7 +77,7 @@ func NewPeerSource(t PeerTransport, nodeID, addr string, router *PeerRouter, cfg
 		transport: t,
 		nodeID:    nodeID,
 		addr:      addr,
-		router:    router,
+		avail:     avail,
 		cfg:       cfg,
 		latency:   lat,
 		bandwidth: bw,
@@ -88,13 +88,13 @@ func (p *PeerSource) Name() string           { return "peer:" + p.nodeID }
 func (p *PeerSource) Latency() time.Duration { return time.Duration(p.latency.Value()) }
 func (p *PeerSource) Bandwidth() float64     { return p.bandwidth.Value() }
 
-// HasPage checks the router for whether this peer should be tried for the page.
-// Returns false if no router is set.
+// HasPage checks the availability index for whether this peer has the page.
+// Returns false if no availability index is set.
 func (p *PeerSource) HasPage(pageNo int64) bool {
-	if p.router == nil {
+	if p.avail == nil {
 		return false
 	}
-	return p.router.ShouldTry(p.nodeID, pageNo)
+	return p.avail.HasPage(p.nodeID, uint32(pageNo))
 }
 
 // NodeID returns the peer's node identifier.
@@ -133,9 +133,6 @@ func (p *PeerSource) GetPage(ctx context.Context, pageNo int64) ([]byte, error) 
 	elapsed := time.Since(start)
 
 	if status[0] == peerStatusMiss {
-		if p.router != nil {
-			p.router.RecordResult(p.nodeID, pageNo, false)
-		}
 		return nil, fmt.Errorf("peer %s: miss for page %d", p.nodeID, pageNo)
 	}
 	if status[0] != peerStatusHit {
@@ -150,9 +147,6 @@ func (p *PeerSource) GetPage(ctx context.Context, pageNo int64) ([]byte, error) 
 	p.latency.Update(float64(elapsed))
 	if elapsed > 0 {
 		p.bandwidth.Update(float64(len(data)) / elapsed.Seconds())
-	}
-	if p.router != nil {
-		p.router.RecordResult(p.nodeID, pageNo, true)
 	}
 	return data, nil
 }

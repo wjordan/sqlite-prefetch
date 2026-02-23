@@ -293,6 +293,18 @@ func (t *Tracker) Siblings(pageNo uint32) []uint32 {
 	return result
 }
 
+// Children returns the child page numbers for an interior page, or ok=false
+// if the page hasn't been parsed yet. Returns a copy.
+func (t *Tracker) Children(interiorPage uint32) ([]uint32, bool) {
+	children, ok := t.interiorChildren[interiorPage]
+	if !ok {
+		return nil, false
+	}
+	cp := make([]uint32, len(children))
+	copy(cp, children)
+	return cp, true
+}
+
 // Reset clears all tracked B-tree structure.
 func (t *Tracker) Reset() {
 	t.interiorChildren = make(map[uint32][]uint32)

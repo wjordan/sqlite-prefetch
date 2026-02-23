@@ -443,6 +443,41 @@ func TestTracker_LookaheadLastInterior(t *testing.T) {
 	}
 }
 
+func TestTracker_Children(t *testing.T) {
+	bt := NewTracker(1024)
+	// 1-based [11, 21, 31] → 0-based [10, 20, 30]
+	children := []uint32{11, 21, 31}
+	page := BuildInteriorTablePage(4096, children)
+	bt.OnFetchComplete(2, page)
+
+	got, ok := bt.Children(2)
+	if !ok {
+		t.Fatal("expected ok=true for parsed interior page")
+	}
+	want := []uint32{10, 20, 30}
+	if len(got) != len(want) {
+		t.Fatalf("Children(2) returned %d children, want %d", len(got), len(want))
+	}
+	for i, c := range want {
+		if got[i] != c {
+			t.Errorf("Children(2)[%d] = %d, want %d", i, got[i], c)
+		}
+	}
+
+	// Unknown page.
+	_, ok = bt.Children(999)
+	if ok {
+		t.Fatal("expected ok=false for unknown page")
+	}
+
+	// Verify it's a copy.
+	got[0] = 9999
+	got2, _ := bt.Children(2)
+	if got2[0] == 9999 {
+		t.Fatal("Children should return a copy")
+	}
+}
+
 func TestTracker_ChildPosition(t *testing.T) {
 	bt := NewTracker(1024)
 	// 1-based [11, 21, 31, 41, 51] → 0-based [10, 20, 30, 40, 50]
