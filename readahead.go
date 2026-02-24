@@ -37,6 +37,7 @@ type ReadaheadEngine struct {
 	// Availability tracking.
 	localAvail  *LocalAvailability
 	remoteAvail *AvailabilityIndex
+	addrMap     *LogicalAddressMap
 
 	// Scan detection: tracks last accessed page's parent and child index.
 	scanParent uint32
@@ -78,13 +79,14 @@ func NewReadaheadEngine(
 	}
 }
 
-// SetAvailability sets the local and remote availability trackers. Both are
-// optional (nil-safe).
-func (r *ReadaheadEngine) SetAvailability(local *LocalAvailability, remote *AvailabilityIndex) {
+// SetAvailability sets the local and remote availability trackers and the
+// shared logical address map. All are optional (nil-safe).
+func (r *ReadaheadEngine) SetAvailability(local *LocalAvailability, remote *AvailabilityIndex, addrMap *LogicalAddressMap) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.localAvail = local
 	r.remoteAvail = remote
+	r.addrMap = addrMap
 }
 
 // OnAccess is called on every page read (fault or cache hit) to detect
@@ -178,13 +180,10 @@ func (r *ReadaheadEngine) OnFetch(pageNo int64, data []byte) {
 		r.btree.OnFetchComplete(uint32(pageNo), data)
 		r.statBtreeParsed.Add(1)
 
-		// Notify availability trackers about the parsed interior page.
+		// Register children in the logical address map.
 		if children, ok := r.btree.Children(uint32(pageNo)); ok {
-			if r.localAvail != nil {
-				r.localAvail.OnInteriorPageParsed(uint32(pageNo), children)
-			}
-			if r.remoteAvail != nil {
-				r.remoteAvail.OnInteriorPageParsed(uint32(pageNo))
+			if r.addrMap != nil {
+				r.addrMap.Register(uint32(pageNo), children)
 			}
 		}
 
@@ -259,8 +258,7 @@ func (r *ReadaheadEngine) ResetStats() {
 	r.statOverflowHit.Store(0)
 }
 
-// Btree returns the underlying B-tree tracker. Used by AvailabilityIndex
-// as a ChildLookup.
+// Btree returns the underlying B-tree tracker.
 func (r *ReadaheadEngine) Btree() *sqlitebtree.Tracker {
 	return r.btree
 }

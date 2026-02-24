@@ -1,6 +1,6 @@
 # sqlite-prefetch
 
-A Go library for intelligently prefetching [SQLite database pages](https://www.sqlite.org/fileformat2.html#pages) from remote storage (S3, peer nodes, or any custom backend). Zero external dependencies.
+A Go library for intelligently prefetching [SQLite database pages](https://www.sqlite.org/fileformat2.html#pages) from remote storage (S3, peer nodes, or any custom backend).
 
 ## The problem
 
@@ -21,7 +21,7 @@ The library combines this B-tree prediction with scan detection, multi-source sc
 | **ReadaheadEngine** | Detects scans via two-consecutive-sibling accesses under the same B-tree parent, then prefetches remaining siblings. Point selects (single child access) trigger no prefetch. Delegates prediction to the B-tree tracker and overflow chain prefetcher. |
 | **btreeTracker** | Parses [interior B-tree pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) (table `0x05` and index `0x02`) for exact child-page prediction, with multi-level lookahead to stay ahead of SQLite's descent. |
 | **Overflow prefetcher** | Parses [leaf table pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) (`0x0D`) to find first overflow page numbers, then cascades through the linked-list chain via next-page pointers. |
-| **AvailabilityIndex** | Tracks which pages each peer has cached, populated via gossip exchange of compact B-tree-aligned child-index extents. Enables exact routing with zero convergence time. |
+| **AvailabilityIndex** | Tracks which pages each peer has cached as [roaring64 bitmaps](https://github.com/RoaringBitmap/roaring) over a logical address space. Enables exact routing with zero convergence time. |
 
 Each component is optional. You can use just the `Prefetcher` for deduplication, add the `Scheduler` for multi-source fetching, or enable the full stack for autonomous B-tree-aware prefetching.
 
@@ -130,11 +130,11 @@ The `Scheduler` implements [hedged requests](https://research.google/pubs/the-ta
 
 ### Peer availability gossip
 
-Peers exchange page availability using compact **child-index extents** — contiguous ranges within a B-tree interior page's child array. A single extent `(interiorPage, start, count)` can cover ~450 children, keeping full snapshots small (~44KB for a 10GB database).
+Peers exchange page availability using [roaring64 bitmaps](https://github.com/RoaringBitmap/roaring) over a logical address space. Each child page is assigned a logical address `interiorPageNo * 4096 + childIdx`, so children of the same interior page are always contiguous — roaring's run-length encoding compresses them efficiently (~4 bytes per run, comparable to the extent-based format this replaced).
 
-Extents are stored opaquely until the local node fetches and parses the corresponding interior page, then lazily resolved to physical page numbers. This matches SQLite's top-down traversal: an interior page is always fetched before its children are needed.
+A shared `LogicalAddressMap` is populated as interior pages are parsed, mapping physical page numbers to logical addresses. The `AvailabilityIndex` stores one roaring64 bitmap per peer; `LocalAvailability` maintains a single bitmap for the local node. Peer removal is O(1) (delete the bitmap) rather than scanning all resolved pages.
 
-Exchange uses QUIC streams (reliable full snapshots on peer join, periodic resync) and datagrams (unreliable deltas on cache changes). Since availability is known upfront, routing achieves 100% hit rate immediately — no convergence period.
+Exchange uses QUIC streams (reliable full snapshots on peer join, periodic resync) and datagrams (unreliable 11-byte deltas on cache changes). Since availability is known upfront, routing achieves 100% hit rate immediately — no convergence period.
 
 ## References
 
@@ -143,7 +143,7 @@ Exchange uses QUIC streams (reliable full snapshots on peer join, periodic resyn
 
 ## Dependencies
 
-Standard library only. Zero external dependencies.
+- [roaring](https://github.com/RoaringBitmap/roaring) (Apache-2.0) — compressed bitmap data structure for peer availability tracking
 
 ## License
 

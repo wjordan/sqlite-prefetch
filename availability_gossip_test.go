@@ -4,14 +4,16 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/RoaringBitmap/roaring/v2/roaring64"
 )
 
 // mockGossipMesh records all sends for testing.
 type mockGossipMesh struct {
-	mu         sync.Mutex
-	datagrams  []meshMessage
-	streams    []meshMessage
-	livePeers  []string
+	mu        sync.Mutex
+	datagrams []meshMessage
+	streams   []meshMessage
+	livePeers []string
 }
 
 type meshMessage struct {
@@ -74,20 +76,19 @@ func (m *mockGossipMesh) GetDatagram(i int) meshMessage {
 }
 
 func TestAvailabilityGossip_OnPeerJoined(t *testing.T) {
-	lookup := newMockChildLookup()
-	lookup.SetChildren(5, []uint32{10, 20, 30})
-	local := NewLocalAvailability(lookup)
-	local.OnInteriorPageParsed(5, []uint32{10, 20, 30})
+	addrMap := NewLogicalAddressMap()
+	addrMap.Register(5, []uint32{10, 20, 30})
+	local := NewLocalAvailability(addrMap)
 	local.OnPageCached(10)
 	local.OnPageCached(20)
 
-	remote := NewAvailabilityIndex(lookup)
+	remote := NewAvailabilityIndex(addrMap)
 	mesh := newMockGossipMesh("peer1", "peer2")
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
 		FullSyncInterval: time.Hour, // disable periodic sync for test
 	})
-	_ = g // suppress unused
+	_ = g
 
 	// Simulate peer join.
 	g.OnPeerJoined("peer1")
@@ -102,25 +103,25 @@ func TestAvailabilityGossip_OnPeerJoined(t *testing.T) {
 	}
 
 	// Verify the snapshot can be decoded.
-	pages, err := DecodeSnapshot(msg.data)
+	bitmapData, err := DecodeSnapshot(msg.data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pages) != 1 {
-		t.Fatalf("expected 1 page in snapshot, got %d", len(pages))
+	bm := roaring64.New()
+	if err := bm.UnmarshalBinary(bitmapData); err != nil {
+		t.Fatal(err)
 	}
-	if pages[0].InteriorPage != 5 {
-		t.Fatalf("expected interior page 5, got %d", pages[0].InteriorPage)
+	if bm.GetCardinality() != 2 {
+		t.Fatalf("expected 2 entries in snapshot, got %d", bm.GetCardinality())
 	}
 }
 
 func TestAvailabilityGossip_DeltaBroadcast(t *testing.T) {
-	lookup := newMockChildLookup()
-	lookup.SetChildren(5, []uint32{10, 20, 30})
-	local := NewLocalAvailability(lookup)
-	local.OnInteriorPageParsed(5, []uint32{10, 20, 30})
+	addrMap := NewLogicalAddressMap()
+	addrMap.Register(5, []uint32{10, 20, 30})
+	local := NewLocalAvailability(addrMap)
 
-	remote := NewAvailabilityIndex(lookup)
+	remote := NewAvailabilityIndex(addrMap)
 	mesh := newMockGossipMesh("peer1", "peer2")
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
@@ -137,25 +138,24 @@ func TestAvailabilityGossip_DeltaBroadcast(t *testing.T) {
 
 	// Verify delta can be decoded.
 	msg := mesh.GetDatagram(0)
-	delta, err := DecodeDelta(msg.data)
+	op, logAddr, err := DecodeDelta(msg.data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if delta.Op != DeltaAdd {
-		t.Fatalf("expected DeltaAdd, got %d", delta.Op)
+	if op != DeltaAdd {
+		t.Fatalf("expected DeltaAdd, got %d", op)
 	}
-	if delta.InteriorPage != 5 {
-		t.Fatalf("expected interior page 5, got %d", delta.InteriorPage)
+	if logAddr != logicalAddr(5, 0) {
+		t.Fatalf("expected logicalAddr(5,0)=%d, got %d", logicalAddr(5, 0), logAddr)
 	}
 }
 
 func TestAvailabilityGossip_HandleSnapshot(t *testing.T) {
-	lookup := newMockChildLookup()
-	lookup.SetChildren(5, []uint32{10, 20, 30})
+	addrMap := NewLogicalAddressMap()
+	addrMap.Register(5, []uint32{10, 20, 30})
 
-	local := NewLocalAvailability(lookup)
-	remote := NewAvailabilityIndex(lookup)
-	remote.OnInteriorPageParsed(5)
+	local := NewLocalAvailability(addrMap)
+	remote := NewAvailabilityIndex(addrMap)
 	mesh := newMockGossipMesh()
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
@@ -163,9 +163,12 @@ func TestAvailabilityGossip_HandleSnapshot(t *testing.T) {
 	})
 
 	// Build and handle a snapshot from peer1.
-	snap := EncodeSnapshot([]PageAvailability{
-		{InteriorPage: 5, Extents: []ChildExtent{{Start: 0, Count: 3}}},
-	})
+	bm := roaring64.New()
+	for i := 0; i < 3; i++ {
+		bm.Add(logicalAddr(5, i))
+	}
+	bitmapData, _ := bm.MarshalBinary()
+	snap := EncodeSnapshot(bitmapData)
 	if err := g.HandleSnapshot("peer1", snap); err != nil {
 		t.Fatal(err)
 	}
@@ -179,25 +182,24 @@ func TestAvailabilityGossip_HandleSnapshot(t *testing.T) {
 }
 
 func TestAvailabilityGossip_HandleDelta(t *testing.T) {
-	lookup := newMockChildLookup()
-	lookup.SetChildren(5, []uint32{10, 20, 30})
+	addrMap := NewLogicalAddressMap()
+	addrMap.Register(5, []uint32{10, 20, 30})
 
-	local := NewLocalAvailability(lookup)
-	remote := NewAvailabilityIndex(lookup)
-	remote.OnInteriorPageParsed(5)
+	local := NewLocalAvailability(addrMap)
+	remote := NewAvailabilityIndex(addrMap)
 	mesh := newMockGossipMesh()
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
 		FullSyncInterval: time.Hour,
 	})
 
-	// Handle a delta from peer1.
-	deltaData := EncodeDelta(AvailabilityDelta{
-		Op:           DeltaAdd,
-		InteriorPage: 5,
-		Extents:      []ChildExtent{{Start: 1, Count: 2}},
-	})
-	if err := g.HandleDelta("peer1", deltaData); err != nil {
+	// Handle a delta from peer1: add children[1] and children[2].
+	deltaData1 := EncodeDelta(DeltaAdd, logicalAddr(5, 1))
+	if err := g.HandleDelta("peer1", deltaData1); err != nil {
+		t.Fatal(err)
+	}
+	deltaData2 := EncodeDelta(DeltaAdd, logicalAddr(5, 2))
+	if err := g.HandleDelta("peer1", deltaData2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -213,12 +215,11 @@ func TestAvailabilityGossip_HandleDelta(t *testing.T) {
 }
 
 func TestAvailabilityGossip_HandleMessage(t *testing.T) {
-	lookup := newMockChildLookup()
-	lookup.SetChildren(5, []uint32{10, 20, 30})
+	addrMap := NewLogicalAddressMap()
+	addrMap.Register(5, []uint32{10, 20, 30})
 
-	local := NewLocalAvailability(lookup)
-	remote := NewAvailabilityIndex(lookup)
-	remote.OnInteriorPageParsed(5)
+	local := NewLocalAvailability(addrMap)
+	remote := NewAvailabilityIndex(addrMap)
 	mesh := newMockGossipMesh()
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
@@ -226,9 +227,12 @@ func TestAvailabilityGossip_HandleMessage(t *testing.T) {
 	})
 
 	// HandleMessage with snapshot.
-	snapData := EncodeSnapshot([]PageAvailability{
-		{InteriorPage: 5, Extents: []ChildExtent{{Start: 0, Count: 3}}},
-	})
+	bm := roaring64.New()
+	for i := 0; i < 3; i++ {
+		bm.Add(logicalAddr(5, i))
+	}
+	bitmapData, _ := bm.MarshalBinary()
+	snapData := EncodeSnapshot(bitmapData)
 	if err := g.HandleMessage("peer1", snapData); err != nil {
 		t.Fatal(err)
 	}
@@ -236,12 +240,8 @@ func TestAvailabilityGossip_HandleMessage(t *testing.T) {
 		t.Fatal("expected HandleMessage to dispatch snapshot")
 	}
 
-	// HandleMessage with delta.
-	deltaData := EncodeDelta(AvailabilityDelta{
-		Op:           DeltaRemove,
-		InteriorPage: 5,
-		Extents:      []ChildExtent{{Start: 0, Count: 1}},
-	})
+	// HandleMessage with delta (remove child 0 = page 10).
+	deltaData := EncodeDelta(DeltaRemove, logicalAddr(5, 0))
 	if err := g.HandleMessage("peer1", deltaData); err != nil {
 		t.Fatal(err)
 	}
@@ -256,12 +256,11 @@ func TestAvailabilityGossip_HandleMessage(t *testing.T) {
 }
 
 func TestAvailabilityGossip_OnPeerLeft(t *testing.T) {
-	lookup := newMockChildLookup()
-	lookup.SetChildren(5, []uint32{10, 20, 30})
+	addrMap := NewLogicalAddressMap()
+	addrMap.Register(5, []uint32{10, 20, 30})
 
-	local := NewLocalAvailability(lookup)
-	remote := NewAvailabilityIndex(lookup)
-	remote.OnInteriorPageParsed(5)
+	local := NewLocalAvailability(addrMap)
+	remote := NewAvailabilityIndex(addrMap)
 	mesh := newMockGossipMesh()
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
@@ -269,9 +268,12 @@ func TestAvailabilityGossip_OnPeerLeft(t *testing.T) {
 	})
 
 	// Add peer1 availability.
-	remote.ApplySnapshot("peer1", []PageAvailability{
-		{InteriorPage: 5, Extents: []ChildExtent{{Start: 0, Count: 3}}},
-	})
+	bm := roaring64.New()
+	for i := 0; i < 3; i++ {
+		bm.Add(logicalAddr(5, i))
+	}
+	snapData, _ := bm.MarshalBinary()
+	remote.ApplySnapshot("peer1", snapData)
 
 	if !remote.HasPage("peer1", 10) {
 		t.Fatal("expected peer1 has page 10")
@@ -287,23 +289,21 @@ func TestAvailabilityGossip_OnPeerLeft(t *testing.T) {
 func TestAvailabilityGossip_FullSyncPropagation(t *testing.T) {
 	// End-to-end: node A caches pages, sends gossip to node B,
 	// node B can query availability.
-	lookup := newMockChildLookup()
-	lookup.SetChildren(5, []uint32{10, 20, 30, 40, 50})
+	addrMap := NewLogicalAddressMap()
+	addrMap.Register(5, []uint32{10, 20, 30, 40, 50})
 
 	// Node A setup.
-	localA := NewLocalAvailability(lookup)
-	localA.OnInteriorPageParsed(5, []uint32{10, 20, 30, 40, 50})
+	localA := NewLocalAvailability(addrMap)
 
 	// Node B setup.
-	remoteB := NewAvailabilityIndex(lookup)
-	remoteB.OnInteriorPageParsed(5)
+	remoteB := NewAvailabilityIndex(addrMap)
 
 	meshA := newMockGossipMesh("nodeB")
-	gossipA := NewAvailabilityGossip(meshA, localA, NewAvailabilityIndex(lookup), AvailabilityGossipConfig{
+	gossipA := NewAvailabilityGossip(meshA, localA, NewAvailabilityIndex(addrMap), AvailabilityGossipConfig{
 		FullSyncInterval: time.Hour,
 	})
 	meshB := newMockGossipMesh("nodeA")
-	gossipB := NewAvailabilityGossip(meshB, NewLocalAvailability(lookup), remoteB, AvailabilityGossipConfig{
+	gossipB := NewAvailabilityGossip(meshB, NewLocalAvailability(addrMap), remoteB, AvailabilityGossipConfig{
 		FullSyncInterval: time.Hour,
 	})
 	_ = gossipA
@@ -337,13 +337,12 @@ func TestAvailabilityGossip_FullSyncPropagation(t *testing.T) {
 }
 
 func TestAvailabilityGossip_PeriodicSync(t *testing.T) {
-	lookup := newMockChildLookup()
-	lookup.SetChildren(5, []uint32{10, 20, 30})
-	local := NewLocalAvailability(lookup)
-	local.OnInteriorPageParsed(5, []uint32{10, 20, 30})
+	addrMap := NewLogicalAddressMap()
+	addrMap.Register(5, []uint32{10, 20, 30})
+	local := NewLocalAvailability(addrMap)
 	local.OnPageCached(10)
 
-	remote := NewAvailabilityIndex(lookup)
+	remote := NewAvailabilityIndex(addrMap)
 	mesh := newMockGossipMesh("peer1")
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
@@ -361,19 +360,23 @@ func TestAvailabilityGossip_PeriodicSync(t *testing.T) {
 
 	// Verify the snapshot is valid.
 	msg := mesh.GetStream(0)
-	pages, err := DecodeSnapshot(msg.data)
+	bitmapData, err := DecodeSnapshot(msg.data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pages) != 1 || pages[0].InteriorPage != 5 {
-		t.Fatalf("unexpected snapshot content: %+v", pages)
+	bm := roaring64.New()
+	if err := bm.UnmarshalBinary(bitmapData); err != nil {
+		t.Fatal(err)
+	}
+	if bm.GetCardinality() != 1 {
+		t.Fatalf("expected 1 entry in snapshot, got %d", bm.GetCardinality())
 	}
 }
 
 func TestAvailabilityGossip_StartStop(t *testing.T) {
-	lookup := newMockChildLookup()
-	local := NewLocalAvailability(lookup)
-	remote := NewAvailabilityIndex(lookup)
+	addrMap := NewLogicalAddressMap()
+	local := NewLocalAvailability(addrMap)
+	remote := NewAvailabilityIndex(addrMap)
 	mesh := newMockGossipMesh()
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{

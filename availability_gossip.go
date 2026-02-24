@@ -83,8 +83,11 @@ func (g *AvailabilityGossip) Stop() {
 // OnPeerJoined should be called when a new peer connects. Sends a full
 // snapshot to the new peer.
 func (g *AvailabilityGossip) OnPeerJoined(peerID string) {
-	snap := g.local.Snapshot()
-	data := EncodeSnapshot(snap)
+	snapData, err := g.local.Snapshot()
+	if err != nil {
+		return
+	}
+	data := EncodeSnapshot(snapData)
 	g.mesh.SendStream(peerID, data)
 }
 
@@ -96,21 +99,20 @@ func (g *AvailabilityGossip) OnPeerLeft(peerID string) {
 
 // HandleSnapshot processes a received snapshot from a remote peer.
 func (g *AvailabilityGossip) HandleSnapshot(peerID string, data []byte) error {
-	pages, err := DecodeSnapshot(data)
+	bitmapData, err := DecodeSnapshot(data)
 	if err != nil {
 		return err
 	}
-	g.remote.ApplySnapshot(peerID, pages)
-	return nil
+	return g.remote.ApplySnapshot(peerID, bitmapData)
 }
 
 // HandleDelta processes a received delta from a remote peer.
 func (g *AvailabilityGossip) HandleDelta(peerID string, data []byte) error {
-	delta, err := DecodeDelta(data)
+	op, logicalAddr, err := DecodeDelta(data)
 	if err != nil {
 		return err
 	}
-	g.remote.ApplyDelta(peerID, delta)
+	g.remote.ApplyDelta(peerID, op, logicalAddr)
 	return nil
 }
 
@@ -132,8 +134,8 @@ func (g *AvailabilityGossip) HandleMessage(peerID string, data []byte) error {
 }
 
 // broadcastDelta sends a delta to all live peers via unreliable datagram.
-func (g *AvailabilityGossip) broadcastDelta(delta AvailabilityDelta) {
-	data := EncodeDelta(delta)
+func (g *AvailabilityGossip) broadcastDelta(op DeltaOp, logicalAddr uint64) {
+	data := EncodeDelta(op, logicalAddr)
 	for _, peerID := range g.mesh.LivePeers() {
 		g.mesh.SendDatagram(peerID, data)
 	}
@@ -157,8 +159,11 @@ func (g *AvailabilityGossip) syncLoop() {
 
 // broadcastSnapshot sends a full snapshot to all live peers via reliable stream.
 func (g *AvailabilityGossip) broadcastSnapshot() {
-	snap := g.local.Snapshot()
-	data := EncodeSnapshot(snap)
+	snapData, err := g.local.Snapshot()
+	if err != nil {
+		return
+	}
+	data := EncodeSnapshot(snapData)
 	for _, peerID := range g.mesh.LivePeers() {
 		g.mesh.SendStream(peerID, data)
 	}

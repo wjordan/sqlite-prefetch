@@ -8,24 +8,22 @@ import (
 )
 
 func TestPeerSource_Properties(t *testing.T) {
-	// Build a btree tracker and availability index.
+	// Build a btree tracker and LogicalAddressMap.
+	addrMap := NewLogicalAddressMap()
 	pf := pagefault.New(&nullSource{}, &nullCache{})
 	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
+	re.SetAvailability(nil, nil, addrMap)
 
 	// Feed interior page 2: 1-based [2, 6] → 0-based [1, 5].
 	children := []uint32{2, 6}
 	page := sqlitebtree.BuildInteriorTablePage(4096, children)
-	re.OnFetch(2, page)
+	re.OnFetch(2, page) // registers children in addrMap
 
-	ai := NewAvailabilityIndex(re.Btree())
-	ai.OnInteriorPageParsed(2)
+	ai := NewAvailabilityIndex(addrMap)
 
-	// Pre-populate availability for node-1.
-	ai.ApplyDelta("node-1", AvailabilityDelta{
-		Op:           DeltaAdd,
-		InteriorPage: 2,
-		Extents:      []ChildExtent{{Start: 0, Count: 2}}, // children[0..1] = 1, 5
-	})
+	// Pre-populate availability for node-1: children[0..1] = pages 1, 5.
+	ai.ApplyDelta("node-1", DeltaAdd, logicalAddr(2, 0))
+	ai.ApplyDelta("node-1", DeltaAdd, logicalAddr(2, 1))
 
 	ps := NewPeerSource(nil, "node-1", "10.0.0.2:9001", ai, PeerSourceConfig{})
 
