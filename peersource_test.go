@@ -2,28 +2,14 @@ package prefetch
 
 import (
 	"testing"
-
-	"github.com/wjordan/sqlite-prefetch/pagefault"
-	"github.com/wjordan/sqlite-prefetch/sqlitebtree"
 )
 
 func TestPeerSource_Properties(t *testing.T) {
-	// Build a btree tracker and LogicalAddressMap.
-	addrMap := NewLogicalAddressMap()
-	pf := pagefault.New(&nullSource{}, &nullCache{})
-	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
-	re.SetAvailability(nil, nil, addrMap)
+	ai := NewAvailabilityIndex()
 
-	// Feed interior page 2: 1-based [2, 6] → 0-based [1, 5].
-	children := []uint32{2, 6}
-	page := sqlitebtree.BuildInteriorTablePage(4096, children)
-	re.OnFetch(2, page) // registers children in addrMap
-
-	ai := NewAvailabilityIndex(addrMap)
-
-	// Pre-populate availability for node-1: children[0..1] = pages 1, 5.
-	ai.ApplyDelta("node-1", DeltaAdd, logicalAddr(2, 0))
-	ai.ApplyDelta("node-1", DeltaAdd, logicalAddr(2, 1))
+	// Pre-populate availability for node-1: pages 1 and 5.
+	ai.ApplyDelta("node-1", DeltaAdd, 1)
+	ai.ApplyDelta("node-1", DeltaAdd, 5)
 
 	ps := NewPeerSource(nil, "node-1", "10.0.0.2:9001", ai, PeerSourceConfig{})
 

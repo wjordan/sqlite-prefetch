@@ -12,22 +12,20 @@ import (
 // --- AvailabilityIndex integration tests ---
 
 func TestAvailabilityIndex_HasPage_WithBtreeTracker(t *testing.T) {
-	// Use a real btree Tracker to populate the LogicalAddressMap.
-	addrMap := NewLogicalAddressMap()
+	// Use a real btree Tracker to parse interior pages.
 	pf := pagefault.New(&nullSource{}, &nullCache{})
 	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
-	re.SetAvailability(nil, nil, addrMap)
 
 	// Feed an interior page: 1-based [11, 21, 31, 41, 51] → 0-based [10, 20, 30, 40, 50].
 	children := []uint32{11, 21, 31, 41, 51}
 	page := sqlitebtree.BuildInteriorTablePage(4096, children)
-	re.OnFetch(2, page) // 0-based page 2 → addrMap.Register(2, [10, 20, 30, 40, 50])
+	re.OnFetch(2, page) // btree tracker parses children
 
-	ai := NewAvailabilityIndex(addrMap)
+	ai := NewAvailabilityIndex()
 
-	// Pre-populate peer availability for all children of interior page 2.
-	for i := 0; i < 5; i++ {
-		ai.ApplyDelta("peerA", DeltaAdd, logicalAddr(2, i))
+	// Pre-populate peer availability using physical page numbers.
+	for _, pg := range []uint32{10, 20, 30, 40, 50} {
+		ai.ApplyDelta("peerA", DeltaAdd, pg)
 	}
 
 	// All 5 children should be routable to peerA.
@@ -44,22 +42,13 @@ func TestAvailabilityIndex_HasPage_WithBtreeTracker(t *testing.T) {
 }
 
 func TestAvailabilityIndex_RemovePeer_Integration(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	pf := pagefault.New(&nullSource{}, &nullCache{})
-	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
-	re.SetAvailability(nil, nil, addrMap)
+	ai := NewAvailabilityIndex()
 
-	children := []uint32{11, 21, 31}
-	page := sqlitebtree.BuildInteriorTablePage(4096, children)
-	re.OnFetch(2, page)
-
-	ai := NewAvailabilityIndex(addrMap)
-
-	for i := 0; i < 3; i++ {
-		ai.ApplyDelta("peerA", DeltaAdd, logicalAddr(2, i))
+	for _, pg := range []uint32{10, 20, 30} {
+		ai.ApplyDelta("peerA", DeltaAdd, pg)
 	}
-	for i := 1; i < 3; i++ {
-		ai.ApplyDelta("peerB", DeltaAdd, logicalAddr(2, i))
+	for _, pg := range []uint32{20, 30} {
+		ai.ApplyDelta("peerB", DeltaAdd, pg)
 	}
 
 	ai.RemovePeer("peerA")
@@ -73,18 +62,10 @@ func TestAvailabilityIndex_RemovePeer_Integration(t *testing.T) {
 }
 
 func TestAvailabilityIndex_Reset_Integration(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	pf := pagefault.New(&nullSource{}, &nullCache{})
-	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
-	re.SetAvailability(nil, nil, addrMap)
+	ai := NewAvailabilityIndex()
 
-	children := []uint32{11, 21}
-	page := sqlitebtree.BuildInteriorTablePage(4096, children)
-	re.OnFetch(2, page)
-
-	ai := NewAvailabilityIndex(addrMap)
-	for i := 0; i < 2; i++ {
-		ai.ApplyDelta("peerA", DeltaAdd, logicalAddr(2, i))
+	for _, pg := range []uint32{10, 20} {
+		ai.ApplyDelta("peerA", DeltaAdd, pg)
 	}
 
 	ai.Reset()
@@ -116,16 +97,13 @@ type routingMetrics struct {
 }
 
 // runWithAvailability simulates routing using pre-populated AvailabilityIndex
-// backed by roaring64 bitmaps.
+// backed by roaring64 bitmaps over physical page numbers.
 func runWithAvailability(sc routingScenario) routingMetrics {
-	addrMap := NewLogicalAddressMap()
-
-	// Build readahead engine with btree structure.
+	// Build readahead engine with btree structure (for btree tracking, not availability).
 	pf := pagefault.New(&nullSource{}, &nullCache{})
 	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
-	re.SetAvailability(nil, nil, addrMap)
 
-	// Feed interior pages.
+	// Feed interior pages to btree tracker.
 	for interiorPgno, children := range sc.btreeStructure {
 		oneBased := make([]uint32, len(children))
 		for i, c := range children {
@@ -135,15 +113,15 @@ func runWithAvailability(sc routingScenario) routingMetrics {
 		re.OnFetch(int64(interiorPgno), page)
 	}
 
-	ai := NewAvailabilityIndex(addrMap)
+	ai := NewAvailabilityIndex()
 
-	// Pre-populate each peer's availability as a roaring64 bitmap.
+	// Pre-populate each peer's availability using physical page numbers.
 	for _, sp := range sc.peers {
 		bm := roaring64.New()
-		for interiorPgno, children := range sc.btreeStructure {
-			for i, child := range children {
+		for _, children := range sc.btreeStructure {
+			for _, child := range children {
 				if sp.pages[int64(child)] {
-					bm.Add(logicalAddr(interiorPgno, i))
+					bm.Add(uint64(child))
 				}
 			}
 		}
@@ -323,30 +301,12 @@ func TestRoutingScenario_BtreeAmplification(t *testing.T) {
 }
 
 func TestRoutingScenario_PeerDeparture(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
+	ai := NewAvailabilityIndex()
 
-	children := make([]uint32, 50)
-	for i := range children {
-		children[i] = uint32(10 + i)
-	}
-
-	pf := pagefault.New(&nullSource{}, &nullCache{})
-	re := NewReadaheadEngine(pf, &nullCache{}, ReadaheadConfig{})
-	re.SetAvailability(nil, nil, addrMap)
-
-	oneBased := make([]uint32, len(children))
-	for i, c := range children {
-		oneBased[i] = c + 1
-	}
-	page := sqlitebtree.BuildInteriorTablePage(4096, oneBased)
-	re.OnFetch(5, page)
-
-	ai := NewAvailabilityIndex(addrMap)
-
-	// Build bitmap for peerA.
+	// Build bitmap for peerA: pages 10..59.
 	bmA := roaring64.New()
-	for i := 0; i < 50; i++ {
-		bmA.Add(logicalAddr(5, i))
+	for i := uint64(10); i < 60; i++ {
+		bmA.Add(i)
 	}
 	dataA, _ := bmA.MarshalBinary()
 	ai.ApplySnapshot("peerA", dataA)

@@ -76,13 +76,11 @@ func (m *mockGossipMesh) GetDatagram(i int) meshMessage {
 }
 
 func TestAvailabilityGossip_OnPeerJoined(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-	local := NewLocalAvailability(addrMap)
+	local := NewLocalAvailability()
 	local.OnPageCached(10)
 	local.OnPageCached(20)
 
-	remote := NewAvailabilityIndex(addrMap)
+	remote := NewAvailabilityIndex()
 	mesh := newMockGossipMesh("peer1", "peer2")
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
@@ -102,8 +100,9 @@ func TestAvailabilityGossip_OnPeerJoined(t *testing.T) {
 		t.Fatalf("expected send to peer1, got %s", msg.peerID)
 	}
 
-	// Verify the snapshot can be decoded.
-	bitmapData, err := DecodeSnapshot(msg.data)
+	// Verify the snapshot can be decoded (strip type prefix).
+	postDispatch := msg.data[1:]
+	bitmapData, err := DecodeSnapshot(postDispatch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,11 +116,9 @@ func TestAvailabilityGossip_OnPeerJoined(t *testing.T) {
 }
 
 func TestAvailabilityGossip_DeltaBroadcast(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-	local := NewLocalAvailability(addrMap)
+	local := NewLocalAvailability()
 
-	remote := NewAvailabilityIndex(addrMap)
+	remote := NewAvailabilityIndex()
 	mesh := newMockGossipMesh("peer1", "peer2")
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
@@ -132,30 +129,31 @@ func TestAvailabilityGossip_DeltaBroadcast(t *testing.T) {
 	// Cache a page — should trigger delta broadcast to all live peers.
 	local.OnPageCached(10)
 
+	// broadcastDelta is async, give it a moment.
+	time.Sleep(20 * time.Millisecond)
+
 	if mesh.DatagramCount() != 2 {
 		t.Fatalf("expected 2 datagrams (1 per peer), got %d", mesh.DatagramCount())
 	}
 
-	// Verify delta can be decoded.
+	// Verify delta can be decoded (strip type prefix).
 	msg := mesh.GetDatagram(0)
-	op, logAddr, err := DecodeDelta(msg.data)
+	postDispatch := msg.data[1:]
+	op, pageNo, err := DecodeDelta(postDispatch)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if op != DeltaAdd {
 		t.Fatalf("expected DeltaAdd, got %d", op)
 	}
-	if logAddr != logicalAddr(5, 0) {
-		t.Fatalf("expected logicalAddr(5,0)=%d, got %d", logicalAddr(5, 0), logAddr)
+	if pageNo != 10 {
+		t.Fatalf("expected page 10, got %d", pageNo)
 	}
 }
 
 func TestAvailabilityGossip_HandleSnapshot(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-
-	local := NewLocalAvailability(addrMap)
-	remote := NewAvailabilityIndex(addrMap)
+	local := NewLocalAvailability()
+	remote := NewAvailabilityIndex()
 	mesh := newMockGossipMesh()
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
@@ -164,12 +162,14 @@ func TestAvailabilityGossip_HandleSnapshot(t *testing.T) {
 
 	// Build and handle a snapshot from peer1.
 	bm := roaring64.New()
-	for i := 0; i < 3; i++ {
-		bm.Add(logicalAddr(5, i))
+	for _, pg := range []uint64{10, 20, 30} {
+		bm.Add(pg)
 	}
 	bitmapData, _ := bm.MarshalBinary()
-	snap := EncodeSnapshot(bitmapData)
-	if err := g.HandleSnapshot("peer1", snap); err != nil {
+
+	// HandleSnapshot expects post-dispatch data: [sub][bitmap...]
+	postDispatch := append([]byte{AvailSubSnapshot}, bitmapData...)
+	if err := g.HandleSnapshot("peer1", postDispatch); err != nil {
 		t.Fatal(err)
 	}
 
@@ -182,24 +182,21 @@ func TestAvailabilityGossip_HandleSnapshot(t *testing.T) {
 }
 
 func TestAvailabilityGossip_HandleDelta(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-
-	local := NewLocalAvailability(addrMap)
-	remote := NewAvailabilityIndex(addrMap)
+	local := NewLocalAvailability()
+	remote := NewAvailabilityIndex()
 	mesh := newMockGossipMesh()
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
 		FullSyncInterval: time.Hour,
 	})
 
-	// Handle a delta from peer1: add children[1] and children[2].
-	deltaData1 := EncodeDelta(DeltaAdd, logicalAddr(5, 1))
-	if err := g.HandleDelta("peer1", deltaData1); err != nil {
+	// Handle deltas from peer1 (post-dispatch format, strip type prefix).
+	delta1 := EncodeDelta(DeltaAdd, 20)
+	if err := g.HandleDelta("peer1", delta1[1:]); err != nil {
 		t.Fatal(err)
 	}
-	deltaData2 := EncodeDelta(DeltaAdd, logicalAddr(5, 2))
-	if err := g.HandleDelta("peer1", deltaData2); err != nil {
+	delta2 := EncodeDelta(DeltaAdd, 30)
+	if err := g.HandleDelta("peer1", delta2[1:]); err != nil {
 		t.Fatal(err)
 	}
 
@@ -215,24 +212,21 @@ func TestAvailabilityGossip_HandleDelta(t *testing.T) {
 }
 
 func TestAvailabilityGossip_HandleMessage(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-
-	local := NewLocalAvailability(addrMap)
-	remote := NewAvailabilityIndex(addrMap)
+	local := NewLocalAvailability()
+	remote := NewAvailabilityIndex()
 	mesh := newMockGossipMesh()
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
 		FullSyncInterval: time.Hour,
 	})
 
-	// HandleMessage with snapshot.
+	// HandleMessage with snapshot (post-dispatch: sub-type byte first).
 	bm := roaring64.New()
-	for i := 0; i < 3; i++ {
-		bm.Add(logicalAddr(5, i))
+	for _, pg := range []uint64{10, 20, 30} {
+		bm.Add(pg)
 	}
 	bitmapData, _ := bm.MarshalBinary()
-	snapData := EncodeSnapshot(bitmapData)
+	snapData := append([]byte{AvailSubSnapshot}, bitmapData...)
 	if err := g.HandleMessage("peer1", snapData); err != nil {
 		t.Fatal(err)
 	}
@@ -240,27 +234,24 @@ func TestAvailabilityGossip_HandleMessage(t *testing.T) {
 		t.Fatal("expected HandleMessage to dispatch snapshot")
 	}
 
-	// HandleMessage with delta (remove child 0 = page 10).
-	deltaData := EncodeDelta(DeltaRemove, logicalAddr(5, 0))
-	if err := g.HandleMessage("peer1", deltaData); err != nil {
+	// HandleMessage with delta (remove page 10, post-dispatch format).
+	deltaEncoded := EncodeDelta(DeltaRemove, 10)
+	if err := g.HandleMessage("peer1", deltaEncoded[1:]); err != nil {
 		t.Fatal(err)
 	}
 	if remote.HasPage("peer1", 10) {
 		t.Fatal("expected page 10 removed by delta via HandleMessage")
 	}
 
-	// HandleMessage with unrelated type.
+	// HandleMessage with unrelated sub-type.
 	if err := g.HandleMessage("peer1", []byte{0xFF, 0x01, 0, 0, 0, 0}); err != nil {
 		t.Fatal("expected no error for unrelated message type")
 	}
 }
 
 func TestAvailabilityGossip_OnPeerLeft(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-
-	local := NewLocalAvailability(addrMap)
-	remote := NewAvailabilityIndex(addrMap)
+	local := NewLocalAvailability()
+	remote := NewAvailabilityIndex()
 	mesh := newMockGossipMesh()
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
@@ -269,8 +260,8 @@ func TestAvailabilityGossip_OnPeerLeft(t *testing.T) {
 
 	// Add peer1 availability.
 	bm := roaring64.New()
-	for i := 0; i < 3; i++ {
-		bm.Add(logicalAddr(5, i))
+	for _, pg := range []uint64{10, 20, 30} {
+		bm.Add(pg)
 	}
 	snapData, _ := bm.MarshalBinary()
 	remote.ApplySnapshot("peer1", snapData)
@@ -289,21 +280,19 @@ func TestAvailabilityGossip_OnPeerLeft(t *testing.T) {
 func TestAvailabilityGossip_FullSyncPropagation(t *testing.T) {
 	// End-to-end: node A caches pages, sends gossip to node B,
 	// node B can query availability.
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30, 40, 50})
 
 	// Node A setup.
-	localA := NewLocalAvailability(addrMap)
+	localA := NewLocalAvailability()
 
 	// Node B setup.
-	remoteB := NewAvailabilityIndex(addrMap)
+	remoteB := NewAvailabilityIndex()
 
 	meshA := newMockGossipMesh("nodeB")
-	gossipA := NewAvailabilityGossip(meshA, localA, NewAvailabilityIndex(addrMap), AvailabilityGossipConfig{
+	gossipA := NewAvailabilityGossip(meshA, localA, NewAvailabilityIndex(), AvailabilityGossipConfig{
 		FullSyncInterval: time.Hour,
 	})
 	meshB := newMockGossipMesh("nodeA")
-	gossipB := NewAvailabilityGossip(meshB, NewLocalAvailability(addrMap), remoteB, AvailabilityGossipConfig{
+	gossipB := NewAvailabilityGossip(meshB, NewLocalAvailability(), remoteB, AvailabilityGossipConfig{
 		FullSyncInterval: time.Hour,
 	})
 	_ = gossipA
@@ -313,11 +302,16 @@ func TestAvailabilityGossip_FullSyncPropagation(t *testing.T) {
 	localA.OnPageCached(20)
 	localA.OnPageCached(30)
 
+	// broadcastDelta is async, give it a moment.
+	time.Sleep(20 * time.Millisecond)
+
 	// Simulate: deliver datagrams from A's mesh to B's gossip handler.
+	// Transport strips the type prefix before dispatch, so we strip it here.
 	meshA.mu.Lock()
 	for _, msg := range meshA.datagrams {
 		if msg.peerID == "nodeB" {
-			gossipB.HandleMessage("nodeA", msg.data)
+			postDispatch := msg.data[1:] // strip StreamTypeAvailability
+			gossipB.HandleMessage("nodeA", postDispatch)
 		}
 	}
 	meshA.mu.Unlock()
@@ -337,12 +331,10 @@ func TestAvailabilityGossip_FullSyncPropagation(t *testing.T) {
 }
 
 func TestAvailabilityGossip_PeriodicSync(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-	local := NewLocalAvailability(addrMap)
+	local := NewLocalAvailability()
 	local.OnPageCached(10)
 
-	remote := NewAvailabilityIndex(addrMap)
+	remote := NewAvailabilityIndex()
 	mesh := newMockGossipMesh("peer1")
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{
@@ -358,9 +350,10 @@ func TestAvailabilityGossip_PeriodicSync(t *testing.T) {
 		t.Fatal("expected at least 1 periodic snapshot stream send")
 	}
 
-	// Verify the snapshot is valid.
+	// Verify the snapshot is valid (strip type prefix).
 	msg := mesh.GetStream(0)
-	bitmapData, err := DecodeSnapshot(msg.data)
+	postDispatch := msg.data[1:]
+	bitmapData, err := DecodeSnapshot(postDispatch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,9 +367,8 @@ func TestAvailabilityGossip_PeriodicSync(t *testing.T) {
 }
 
 func TestAvailabilityGossip_StartStop(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	local := NewLocalAvailability(addrMap)
-	remote := NewAvailabilityIndex(addrMap)
+	local := NewLocalAvailability()
+	remote := NewAvailabilityIndex()
 	mesh := newMockGossipMesh()
 
 	g := NewAvailabilityGossip(mesh, local, remote, AvailabilityGossipConfig{

@@ -37,10 +37,10 @@ func (c *AvailabilityGossipConfig) withDefaults() {
 type AvailabilityGossip struct {
 	mu sync.Mutex
 
-	mesh       GossipMesh
-	local      *LocalAvailability
-	remote     *AvailabilityIndex
-	cfg        AvailabilityGossipConfig
+	mesh   GossipMesh
+	local  *LocalAvailability
+	remote *AvailabilityIndex
+	cfg    AvailabilityGossipConfig
 
 	stopCh chan struct{}
 	done   chan struct{}
@@ -98,6 +98,7 @@ func (g *AvailabilityGossip) OnPeerLeft(peerID string) {
 }
 
 // HandleSnapshot processes a received snapshot from a remote peer.
+// Expects post-dispatch data starting from the sub-type byte.
 func (g *AvailabilityGossip) HandleSnapshot(peerID string, data []byte) error {
 	bitmapData, err := DecodeSnapshot(data)
 	if err != nil {
@@ -107,24 +108,24 @@ func (g *AvailabilityGossip) HandleSnapshot(peerID string, data []byte) error {
 }
 
 // HandleDelta processes a received delta from a remote peer.
+// Expects post-dispatch data starting from the sub-type byte.
 func (g *AvailabilityGossip) HandleDelta(peerID string, data []byte) error {
-	op, logicalAddr, err := DecodeDelta(data)
+	op, pageNo, err := DecodeDelta(data)
 	if err != nil {
 		return err
 	}
-	g.remote.ApplyDelta(peerID, op, logicalAddr)
+	g.remote.ApplyDelta(peerID, op, pageNo)
 	return nil
 }
 
-// HandleMessage dispatches a received message based on the sub-type byte.
+// HandleMessage dispatches a received post-dispatch message based on the
+// sub-type byte. The transport layer has already stripped the
+// StreamTypeAvailability prefix during dispatch.
 func (g *AvailabilityGossip) HandleMessage(peerID string, data []byte) error {
-	if len(data) < 2 {
+	if len(data) < 1 {
 		return nil
 	}
-	if data[0] != StreamTypeAvailability {
-		return nil
-	}
-	switch data[1] {
+	switch data[0] {
 	case AvailSubSnapshot:
 		return g.HandleSnapshot(peerID, data)
 	case AvailSubDelta:
@@ -134,11 +135,15 @@ func (g *AvailabilityGossip) HandleMessage(peerID string, data []byte) error {
 }
 
 // broadcastDelta sends a delta to all live peers via unreliable datagram.
-func (g *AvailabilityGossip) broadcastDelta(op DeltaOp, logicalAddr uint64) {
-	data := EncodeDelta(op, logicalAddr)
-	for _, peerID := range g.mesh.LivePeers() {
-		g.mesh.SendDatagram(peerID, data)
-	}
+// Runs the broadcast loop in a goroutine to avoid blocking the caller
+// (which may hold locks).
+func (g *AvailabilityGossip) broadcastDelta(op DeltaOp, pageNo uint32) {
+	data := EncodeDelta(op, pageNo)
+	go func() {
+		for _, peerID := range g.mesh.LivePeers() {
+			g.mesh.SendDatagram(peerID, data)
+		}
+	}()
 }
 
 // syncLoop periodically sends full snapshots to all peers.

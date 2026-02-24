@@ -7,8 +7,10 @@ import (
 )
 
 func TestEncodeDecodeSnapshot_Empty(t *testing.T) {
-	data := EncodeSnapshot(nil)
-	bitmapData, err := DecodeSnapshot(data)
+	encoded := EncodeSnapshot(nil)
+	// Strip the type prefix (transport dispatch strips it before delivery).
+	postDispatch := encoded[1:]
+	bitmapData, err := DecodeSnapshot(postDispatch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -19,16 +21,18 @@ func TestEncodeDecodeSnapshot_Empty(t *testing.T) {
 
 func TestEncodeDecodeSnapshot_RoundTrip(t *testing.T) {
 	bm := roaring64.New()
-	bm.Add(logicalAddr(42, 0))
-	bm.Add(logicalAddr(42, 5))
-	bm.Add(logicalAddr(42, 15))
+	bm.Add(42)
+	bm.Add(100)
+	bm.Add(999)
 	original, err := bm.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	data := EncodeSnapshot(original)
-	decoded, err := DecodeSnapshot(data)
+	encoded := EncodeSnapshot(original)
+	// Strip the type prefix for decode.
+	postDispatch := encoded[1:]
+	decoded, err := DecodeSnapshot(postDispatch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,83 +45,85 @@ func TestEncodeDecodeSnapshot_RoundTrip(t *testing.T) {
 	if bm2.GetCardinality() != 3 {
 		t.Fatalf("expected 3 entries, got %d", bm2.GetCardinality())
 	}
-	if !bm2.Contains(logicalAddr(42, 0)) {
-		t.Fatal("missing addr(42,0)")
+	if !bm2.Contains(42) {
+		t.Fatal("missing page 42")
 	}
-	if !bm2.Contains(logicalAddr(42, 15)) {
-		t.Fatal("missing addr(42,15)")
+	if !bm2.Contains(999) {
+		t.Fatal("missing page 999")
 	}
 }
 
 func TestEncodeDecodeDelta_Add(t *testing.T) {
-	addr := logicalAddr(100, 5)
-	data := EncodeDelta(DeltaAdd, addr)
-	op, logAddr, err := DecodeDelta(data)
+	encoded := EncodeDelta(DeltaAdd, 42)
+	// Strip the type prefix for decode.
+	postDispatch := encoded[1:]
+	op, pageNo, err := DecodeDelta(postDispatch)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if op != DeltaAdd {
 		t.Fatalf("op = %d, want DeltaAdd", op)
 	}
-	if logAddr != addr {
-		t.Fatalf("logicalAddr = %d, want %d", logAddr, addr)
+	if pageNo != 42 {
+		t.Fatalf("pageNo = %d, want 42", pageNo)
 	}
 }
 
 func TestEncodeDecodeDelta_Remove(t *testing.T) {
-	addr := logicalAddr(200, 10)
-	data := EncodeDelta(DeltaRemove, addr)
-	op, logAddr, err := DecodeDelta(data)
+	encoded := EncodeDelta(DeltaRemove, 200)
+	// Strip the type prefix for decode.
+	postDispatch := encoded[1:]
+	op, pageNo, err := DecodeDelta(postDispatch)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if op != DeltaRemove {
 		t.Fatalf("op = %d, want DeltaRemove", op)
 	}
-	if logAddr != addr {
-		t.Fatalf("logicalAddr = %d, want %d", logAddr, addr)
+	if pageNo != 200 {
+		t.Fatalf("pageNo = %d, want 200", pageNo)
 	}
 }
 
 func TestDecodeSnapshot_TooShort(t *testing.T) {
-	_, err := DecodeSnapshot([]byte{0x13})
+	_, err := DecodeSnapshot(nil)
 	if err == nil {
 		t.Fatal("expected error for too-short snapshot")
 	}
 }
 
-func TestDecodeSnapshot_InvalidHeader(t *testing.T) {
-	_, err := DecodeSnapshot([]byte{0xFF, 0x01})
+func TestDecodeSnapshot_InvalidSubType(t *testing.T) {
+	_, err := DecodeSnapshot([]byte{0xFF})
 	if err == nil {
-		t.Fatal("expected error for invalid header")
+		t.Fatal("expected error for invalid sub-type")
 	}
 }
 
 func TestDecodeDelta_TooShort(t *testing.T) {
-	_, _, err := DecodeDelta([]byte{0x13, 0x02, 0x01})
+	_, _, err := DecodeDelta([]byte{0x02, 0x01})
 	if err == nil {
 		t.Fatal("expected error for too-short delta")
 	}
 }
 
-func TestDecodeDelta_InvalidHeader(t *testing.T) {
-	_, _, err := DecodeDelta([]byte{0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+func TestDecodeDelta_InvalidSubType(t *testing.T) {
+	_, _, err := DecodeDelta([]byte{0xFF, 0x01, 0, 0, 0, 0})
 	if err == nil {
-		t.Fatal("expected error for invalid header")
+		t.Fatal("expected error for invalid sub-type")
 	}
 }
 
 func TestDelta_WireSize(t *testing.T) {
-	data := EncodeDelta(DeltaAdd, logicalAddr(5, 0))
-	// [1B type][1B sub][1B op][8B logicalAddr] = 11 bytes
-	if len(data) != 11 {
-		t.Fatalf("delta size = %d, want 11", len(data))
+	data := EncodeDelta(DeltaAdd, 5)
+	// [1B type][1B sub][1B op][4B pageNo] = 7 bytes
+	if len(data) != 7 {
+		t.Fatalf("delta size = %d, want 7", len(data))
 	}
 }
 
 func TestSnapshot_WireSize(t *testing.T) {
 	bm := roaring64.New()
-	bm.Add(logicalAddr(5, 0))
+	bm.Add(5)
 	bitmapData, _ := bm.MarshalBinary()
 	data := EncodeSnapshot(bitmapData)
 	// [1B type][1B sub][bitmap bytes]

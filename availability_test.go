@@ -7,50 +7,33 @@ import (
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
 )
 
-// logicalAddr computes the logical address for a child at the given index
-// under an interior page.
-func logicalAddr(interiorPage uint32, childIdx int) uint64 {
-	return uint64(interiorPage)*LogicalStride + uint64(childIdx)
-}
-
 // --- AvailabilityIndex tests ---
 
-func TestAvailabilityIndex_HasPage_NotRegistered(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	// Don't register anything — addrMap.Lookup will fail.
-	ai := NewAvailabilityIndex(addrMap)
+func TestAvailabilityIndex_HasPage_NoPeer(t *testing.T) {
+	ai := NewAvailabilityIndex()
 
-	ai.ApplyDelta("peer1", DeltaAdd, logicalAddr(5, 0))
+	ai.ApplyDelta("peer1", DeltaAdd, 10)
 
-	if ai.HasPage("peer1", 10) {
-		t.Fatal("expected HasPage=false when address map not populated")
+	if !ai.HasPage("peer1", 10) {
+		t.Fatal("expected HasPage=true after delta add")
+	}
+	if ai.HasPage("peer2", 10) {
+		t.Fatal("expected HasPage=false for unknown peer")
 	}
 }
 
-func TestAvailabilityIndex_ApplyDelta_ThenRegister(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	ai := NewAvailabilityIndex(addrMap)
+func TestAvailabilityIndex_ApplyDelta(t *testing.T) {
+	ai := NewAvailabilityIndex()
 
-	// Apply deltas for children[0..2] of interior page 5.
-	for i := 0; i < 3; i++ {
-		ai.ApplyDelta("peer1", DeltaAdd, logicalAddr(5, i))
-	}
+	ai.ApplyDelta("peer1", DeltaAdd, 10)
+	ai.ApplyDelta("peer1", DeltaAdd, 20)
+	ai.ApplyDelta("peer1", DeltaAdd, 30)
 
-	// Not yet registered — HasPage returns false.
-	if ai.HasPage("peer1", 10) {
-		t.Fatal("expected HasPage=false before register")
-	}
-
-	// Register the interior page → resolves lookups.
-	addrMap.Register(5, []uint32{10, 20, 30, 40, 50})
-
-	// Now children 10, 20, 30 should be found.
 	for _, pg := range []uint32{10, 20, 30} {
 		if !ai.HasPage("peer1", pg) {
-			t.Fatalf("expected HasPage(peer1, %d)=true after register", pg)
+			t.Fatalf("expected HasPage(peer1, %d)=true", pg)
 		}
 	}
-	// Children 40, 50 not in bitmap.
 	for _, pg := range []uint32{40, 50} {
 		if ai.HasPage("peer1", pg) {
 			t.Fatalf("expected HasPage(peer1, %d)=false", pg)
@@ -58,38 +41,16 @@ func TestAvailabilityIndex_ApplyDelta_ThenRegister(t *testing.T) {
 	}
 }
 
-func TestAvailabilityIndex_RegisterFirst_ThenDelta(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30, 40, 50})
-	ai := NewAvailabilityIndex(addrMap)
-
-	// Apply delta → should be queryable immediately.
-	ai.ApplyDelta("peer1", DeltaAdd, logicalAddr(5, 1)) // child 20
-	ai.ApplyDelta("peer1", DeltaAdd, logicalAddr(5, 2)) // child 30
-
-	if ai.HasPage("peer1", 10) {
-		t.Fatal("expected HasPage(peer1, 10)=false")
-	}
-	if !ai.HasPage("peer1", 20) {
-		t.Fatal("expected HasPage(peer1, 20)=true")
-	}
-	if !ai.HasPage("peer1", 30) {
-		t.Fatal("expected HasPage(peer1, 30)=true")
-	}
-}
-
 func TestAvailabilityIndex_MultiplePeers(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30, 40, 50})
-	ai := NewAvailabilityIndex(addrMap)
+	ai := NewAvailabilityIndex()
 
-	// peer1: children[0..2] = 10, 20, 30
-	for i := 0; i < 3; i++ {
-		ai.ApplyDelta("peer1", DeltaAdd, logicalAddr(5, i))
+	// peer1: pages 10, 20, 30
+	for _, pg := range []uint32{10, 20, 30} {
+		ai.ApplyDelta("peer1", DeltaAdd, pg)
 	}
-	// peer2: children[2..4] = 30, 40, 50
-	for i := 2; i < 5; i++ {
-		ai.ApplyDelta("peer2", DeltaAdd, logicalAddr(5, i))
+	// peer2: pages 30, 40, 50
+	for _, pg := range []uint32{30, 40, 50} {
+		ai.ApplyDelta("peer2", DeltaAdd, pg)
 	}
 
 	// Page 30 is claimed by both peers.
@@ -116,12 +77,10 @@ func TestAvailabilityIndex_MultiplePeers(t *testing.T) {
 }
 
 func TestAvailabilityIndex_RemovePeer(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-	ai := NewAvailabilityIndex(addrMap)
+	ai := NewAvailabilityIndex()
 
-	for i := 0; i < 3; i++ {
-		ai.ApplyDelta("peer1", DeltaAdd, logicalAddr(5, i))
+	for _, pg := range []uint32{10, 20, 30} {
+		ai.ApplyDelta("peer1", DeltaAdd, pg)
 	}
 
 	if !ai.HasPage("peer1", 10) {
@@ -136,18 +95,14 @@ func TestAvailabilityIndex_RemovePeer(t *testing.T) {
 }
 
 func TestAvailabilityIndex_DeltaRemove(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30, 40, 50})
-	ai := NewAvailabilityIndex(addrMap)
+	ai := NewAvailabilityIndex()
 
-	// Add all 5 children.
-	for i := 0; i < 5; i++ {
-		ai.ApplyDelta("peer1", DeltaAdd, logicalAddr(5, i))
+	for _, pg := range []uint32{10, 20, 30, 40, 50} {
+		ai.ApplyDelta("peer1", DeltaAdd, pg)
 	}
 
-	// Remove children[1..2] = 20, 30.
-	ai.ApplyDelta("peer1", DeltaRemove, logicalAddr(5, 1))
-	ai.ApplyDelta("peer1", DeltaRemove, logicalAddr(5, 2))
+	ai.ApplyDelta("peer1", DeltaRemove, 20)
+	ai.ApplyDelta("peer1", DeltaRemove, 30)
 
 	if !ai.HasPage("peer1", 10) {
 		t.Fatal("expected page 10 still available")
@@ -164,30 +119,27 @@ func TestAvailabilityIndex_DeltaRemove(t *testing.T) {
 }
 
 func TestAvailabilityIndex_ApplySnapshot(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-	addrMap.Register(6, []uint32{100, 200, 300})
-	ai := NewAvailabilityIndex(addrMap)
+	ai := NewAvailabilityIndex()
 
-	// Initial state: peer1 has all of page 5's children.
-	for i := 0; i < 3; i++ {
-		ai.ApplyDelta("peer1", DeltaAdd, logicalAddr(5, i))
+	// Initial state: peer1 has pages 10, 20, 30.
+	for _, pg := range []uint32{10, 20, 30} {
+		ai.ApplyDelta("peer1", DeltaAdd, pg)
 	}
 
-	// Snapshot replaces everything: peer1 now only has page 6 children[0..1].
+	// Snapshot replaces everything: peer1 now only has pages 100, 200.
 	bm := roaring64.New()
-	bm.Add(logicalAddr(6, 0))
-	bm.Add(logicalAddr(6, 1))
+	bm.Add(100)
+	bm.Add(200)
 	snapData, _ := bm.MarshalBinary()
 	if err := ai.ApplySnapshot("peer1", snapData); err != nil {
 		t.Fatal(err)
 	}
 
-	// Old page 5 entries should be gone.
+	// Old entries should be gone.
 	if ai.HasPage("peer1", 10) {
 		t.Fatal("expected old page 10 gone after snapshot")
 	}
-	// New page 6 entries should be present.
+	// New entries should be present.
 	if !ai.HasPage("peer1", 100) {
 		t.Fatal("expected page 100 from snapshot")
 	}
@@ -200,12 +152,10 @@ func TestAvailabilityIndex_ApplySnapshot(t *testing.T) {
 }
 
 func TestAvailabilityIndex_Reset(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-	ai := NewAvailabilityIndex(addrMap)
+	ai := NewAvailabilityIndex()
 
-	for i := 0; i < 3; i++ {
-		ai.ApplyDelta("peer1", DeltaAdd, logicalAddr(5, i))
+	for _, pg := range []uint32{10, 20, 30} {
+		ai.ApplyDelta("peer1", DeltaAdd, pg)
 	}
 
 	ai.Reset()
@@ -215,66 +165,8 @@ func TestAvailabilityIndex_Reset(t *testing.T) {
 	}
 }
 
-func TestAvailabilityIndex_SnapshotBeforeRegister(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	ai := NewAvailabilityIndex(addrMap)
-
-	// Snapshot before register — bitmap is stored, but lookup fails.
-	bm := roaring64.New()
-	for i := 0; i < 3; i++ {
-		bm.Add(logicalAddr(5, i))
-	}
-	snapData, _ := bm.MarshalBinary()
-	if err := ai.ApplySnapshot("peer1", snapData); err != nil {
-		t.Fatal(err)
-	}
-
-	if ai.HasPage("peer1", 10) {
-		t.Fatal("expected HasPage=false before register")
-	}
-
-	// Now register → lookup succeeds.
-	addrMap.Register(5, []uint32{10, 20, 30})
-
-	if !ai.HasPage("peer1", 10) {
-		t.Fatal("expected HasPage=true after register")
-	}
-}
-
-func TestAvailabilityIndex_MultipleInteriorPages(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	ai := NewAvailabilityIndex(addrMap)
-
-	// Add deltas for two interior pages.
-	for i := 0; i < 3; i++ {
-		ai.ApplyDelta("peer1", DeltaAdd, logicalAddr(5, i))
-	}
-	for i := 1; i < 3; i++ {
-		ai.ApplyDelta("peer1", DeltaAdd, logicalAddr(6, i))
-	}
-
-	// Register page 5 only.
-	addrMap.Register(5, []uint32{10, 20, 30})
-
-	if !ai.HasPage("peer1", 10) {
-		t.Fatal("expected page 10 resolved")
-	}
-	if ai.HasPage("peer1", 200) {
-		t.Fatal("expected page 200 NOT resolved (page 6 not registered)")
-	}
-
-	// Register page 6.
-	addrMap.Register(6, []uint32{100, 200, 300})
-
-	if !ai.HasPage("peer1", 200) {
-		t.Fatal("expected page 200 resolved after registering page 6")
-	}
-}
-
 func TestAvailabilityIndex_EmptySnapshot(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-	ai := NewAvailabilityIndex(addrMap)
+	ai := NewAvailabilityIndex()
 
 	// Apply an empty snapshot (nil data).
 	if err := ai.ApplySnapshot("peer1", nil); err != nil {
@@ -289,15 +181,13 @@ func TestAvailabilityIndex_EmptySnapshot(t *testing.T) {
 // --- LocalAvailability tests ---
 
 func TestLocalAvailability_OnPageCached(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30, 40, 50})
-	la := NewLocalAvailability(addrMap)
+	la := NewLocalAvailability()
 
-	var deltas []uint64
+	var deltas []uint32
 	var mu sync.Mutex
-	la.OnChange(func(op DeltaOp, addr uint64) {
+	la.OnChange(func(op DeltaOp, pageNo uint32) {
 		mu.Lock()
-		deltas = append(deltas, addr)
+		deltas = append(deltas, pageNo)
 		mu.Unlock()
 	})
 
@@ -310,36 +200,32 @@ func TestLocalAvailability_OnPageCached(t *testing.T) {
 	if len(deltas) != 3 {
 		t.Fatalf("expected 3 deltas, got %d", len(deltas))
 	}
-	// Each delta is a single logical address add.
-	if deltas[0] != logicalAddr(5, 0) {
-		t.Fatalf("expected logicalAddr(5,0), got %d", deltas[0])
+	if deltas[0] != 10 {
+		t.Fatalf("expected page 10, got %d", deltas[0])
 	}
-	if deltas[2] != logicalAddr(5, 2) {
-		t.Fatalf("expected logicalAddr(5,2), got %d", deltas[2])
+	if deltas[2] != 30 {
+		t.Fatalf("expected page 30, got %d", deltas[2])
 	}
 }
 
-func TestLocalAvailability_OnPageCached_UnknownPage(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	la := NewLocalAvailability(addrMap)
+func TestLocalAvailability_OnPageCached_AllTracked(t *testing.T) {
+	la := NewLocalAvailability()
 
 	var count int
-	la.OnChange(func(op DeltaOp, addr uint64) {
+	la.OnChange(func(op DeltaOp, pageNo uint32) {
 		count++
 	})
 
-	// Unknown page — should be silently ignored.
+	// All pages are tracked (no addrMap filtering).
 	la.OnPageCached(999)
 
-	if count != 0 {
-		t.Fatal("expected no delta for unknown page")
+	if count != 1 {
+		t.Fatalf("expected 1 delta, got %d", count)
 	}
 }
 
 func TestLocalAvailability_Snapshot(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-	la := NewLocalAvailability(addrMap)
+	la := NewLocalAvailability()
 
 	la.OnPageCached(10)
 	la.OnPageCached(30)
@@ -356,18 +242,16 @@ func TestLocalAvailability_Snapshot(t *testing.T) {
 	if bm.GetCardinality() != 2 {
 		t.Fatalf("expected 2 entries in snapshot, got %d", bm.GetCardinality())
 	}
-	if !bm.Contains(logicalAddr(5, 0)) {
-		t.Fatal("expected snapshot to contain child 0")
+	if !bm.Contains(10) {
+		t.Fatal("expected snapshot to contain page 10")
 	}
-	if !bm.Contains(logicalAddr(5, 2)) {
-		t.Fatal("expected snapshot to contain child 2")
+	if !bm.Contains(30) {
+		t.Fatal("expected snapshot to contain page 30")
 	}
 }
 
 func TestLocalAvailability_Reset(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-	la := NewLocalAvailability(addrMap)
+	la := NewLocalAvailability()
 	la.OnPageCached(10)
 
 	la.Reset()
@@ -386,12 +270,10 @@ func TestLocalAvailability_Reset(t *testing.T) {
 }
 
 func TestLocalAvailability_DuplicateCache(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30})
-	la := NewLocalAvailability(addrMap)
+	la := NewLocalAvailability()
 
 	var count int
-	la.OnChange(func(op DeltaOp, addr uint64) {
+	la.OnChange(func(op DeltaOp, pageNo uint32) {
 		count++
 	})
 
@@ -404,9 +286,7 @@ func TestLocalAvailability_DuplicateCache(t *testing.T) {
 }
 
 func TestLocalAvailability_DiscontiguousPages(t *testing.T) {
-	addrMap := NewLogicalAddressMap()
-	addrMap.Register(5, []uint32{10, 20, 30, 40, 50})
-	la := NewLocalAvailability(addrMap)
+	la := NewLocalAvailability()
 
 	la.OnPageCached(10)
 	la.OnPageCached(30)
@@ -420,7 +300,6 @@ func TestLocalAvailability_DiscontiguousPages(t *testing.T) {
 	if err := bm.UnmarshalBinary(snapData); err != nil {
 		t.Fatal(err)
 	}
-	// Indices 0, 2, 4 — three separate entries.
 	if bm.GetCardinality() != 3 {
 		t.Fatalf("expected 3 entries, got %d", bm.GetCardinality())
 	}

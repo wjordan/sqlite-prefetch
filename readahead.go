@@ -34,10 +34,8 @@ type ReadaheadEngine struct {
 	fetcher *pagefault.Fetcher
 	cache   pagefault.PageCache
 
-	// Availability tracking.
-	localAvail  *LocalAvailability
-	remoteAvail *AvailabilityIndex
-	addrMap     *LogicalAddressMap
+	// Availability tracking (optional, nil-safe).
+	localAvail *LocalAvailability
 
 	// Scan detection: tracks last accessed page's parent and child index.
 	scanParent uint32
@@ -60,9 +58,7 @@ type ReadaheadEngine struct {
 // Compile-time check that ReadaheadEngine satisfies pagefault.FetchObserver.
 var _ pagefault.FetchObserver = (*ReadaheadEngine)(nil)
 
-// NewReadaheadEngine creates a ReadaheadEngine. The localAvail and
-// remoteAvail parameters are optional; pass nil to disable availability
-// tracking.
+// NewReadaheadEngine creates a ReadaheadEngine.
 func NewReadaheadEngine(
 	fetcher *pagefault.Fetcher,
 	cache pagefault.PageCache,
@@ -79,14 +75,11 @@ func NewReadaheadEngine(
 	}
 }
 
-// SetAvailability sets the local and remote availability trackers and the
-// shared logical address map. All are optional (nil-safe).
-func (r *ReadaheadEngine) SetAvailability(local *LocalAvailability, remote *AvailabilityIndex, addrMap *LogicalAddressMap) {
+// SetLocalAvailability sets the local availability tracker. Optional (nil-safe).
+func (r *ReadaheadEngine) SetLocalAvailability(local *LocalAvailability) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.localAvail = local
-	r.remoteAvail = remote
-	r.addrMap = addrMap
 }
 
 // OnAccess is called on every page read (fault or cache hit) to detect
@@ -141,13 +134,17 @@ func (r *ReadaheadEngine) OnFetch(pageNo int64, data []byte) {
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.onFetchLocked(pageNo, data)
+	r.mu.Unlock()
 
-	// Notify local availability that this page is now cached.
+	// Notify availability OUTSIDE the lock.
 	if r.localAvail != nil {
 		r.localAvail.OnPageCached(uint32(pageNo))
 	}
+}
 
+// onFetchLocked performs the lock-held portion of OnFetch.
+func (r *ReadaheadEngine) onFetchLocked(pageNo int64, data []byte) {
 	// 1. Check if this is a known overflow page.
 	if r.overflowSet[uint32(pageNo)] {
 		delete(r.overflowSet, uint32(pageNo))
@@ -179,13 +176,6 @@ func (r *ReadaheadEngine) OnFetch(pageNo int64, data []byte) {
 	case 0x05, 0x02: // interior table or index page
 		r.btree.OnFetchComplete(uint32(pageNo), data)
 		r.statBtreeParsed.Add(1)
-
-		// Register children in the logical address map.
-		if children, ok := r.btree.Children(uint32(pageNo)); ok {
-			if r.addrMap != nil {
-				r.addrMap.Register(uint32(pageNo), children)
-			}
-		}
 
 	case 0x0D: // leaf table page — extract overflow pointers
 		sqlitePgno := uint32(pageNo) + 1 // convert to 1-based
