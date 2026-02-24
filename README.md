@@ -130,7 +130,7 @@ The `Scheduler` implements [hedged requests](https://research.google/pubs/the-ta
 
 ### Peer availability gossip
 
-Peers exchange page availability using [roaring64 bitmaps](https://github.com/RoaringBitmap/roaring) over a logical address space. Each child page is assigned a logical address `interiorPageNo * 4096 + childIdx`, so children of the same interior page are always contiguous — roaring's run-length encoding compresses them efficiently (~4 bytes per run, comparable to the extent-based format this replaced).
+Peers exchange page availability using [roaring64 bitmaps](https://github.com/RoaringBitmap/roaring) over a logical address space. Each child page is assigned a logical address `interiorPageNo * 4096 + childIdx`, so children of the same interior page are always contiguous — roaring's run-length encoding compresses them efficiently (~4 bytes per run).
 
 A shared `LogicalAddressMap` is populated as interior pages are parsed, mapping physical page numbers to logical addresses. The `AvailabilityIndex` stores one roaring64 bitmap per peer; `LocalAvailability` maintains a single bitmap for the local node. Peer removal is O(1) (delete the bitmap) rather than scanning all resolved pages.
 
