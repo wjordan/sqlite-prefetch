@@ -34,8 +34,8 @@ type ReadaheadEngine struct {
 	fetcher *pagefault.Fetcher
 	cache   pagefault.PageCache
 
-	// Availability tracking (optional, nil-safe).
-	localAvail *LocalAvailability
+	// Optional callback invoked after every successful fetch with the 0-based page number.
+	onPageFetched func(uint32)
 
 	// Scan detection: tracks last accessed page's parent and child index.
 	scanParent uint32
@@ -75,11 +75,12 @@ func NewReadaheadEngine(
 	}
 }
 
-// SetLocalAvailability sets the local availability tracker. Optional (nil-safe).
-func (r *ReadaheadEngine) SetLocalAvailability(local *LocalAvailability) {
+// SetOnPageFetched sets a callback invoked after every successful fetch
+// with the 0-based page number. Optional (nil-safe).
+func (r *ReadaheadEngine) SetOnPageFetched(fn func(uint32)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.localAvail = local
+	r.onPageFetched = fn
 }
 
 // OnAccess is called on every page read (fault or cache hit) to detect
@@ -137,9 +138,9 @@ func (r *ReadaheadEngine) OnFetch(pageNo int64, data []byte) {
 	r.onFetchLocked(pageNo, data)
 	r.mu.Unlock()
 
-	// Notify availability OUTSIDE the lock.
-	if r.localAvail != nil {
-		r.localAvail.OnPageCached(uint32(pageNo))
+	// Notify caller OUTSIDE the lock.
+	if r.onPageFetched != nil {
+		r.onPageFetched(uint32(pageNo))
 	}
 }
 
