@@ -7,10 +7,10 @@
 // then prefetches remaining siblings. It implements [pagefault.FetchObserver]
 // and delegates B-tree structure tracking to [sqlitebtree.Tracker].
 //
-// The [AvailabilityIndex] tracks which pages remote peers have cached, using
-// compact child-index extents aligned with B-tree interior pages. Extents are
-// stored opaquely until the local node parses the corresponding interior page,
-// at which point they are resolved to physical page numbers.
+// The [AvailabilityIndex] tracks which pages remote peers have cached as
+// roaring64 bitmaps over physical page numbers. [LocalAvailability] maintains
+// a single bitmap for the local node. Peers exchange availability via reliable
+// snapshots and unreliable single-page deltas through [AvailabilityGossip].
 //
 // Source wrappers ([S3Source], [PeerSource]) implement [pagefault.Source]
 // with EWMA-tracked latency and bandwidth.
