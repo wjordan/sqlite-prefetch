@@ -66,7 +66,9 @@ func (s *Scheduler) Sources() []Source {
 // Fetch retrieves a single page, racing sources with hedged requests.
 // The best source (by estimatedTime) is tried immediately. If it hasn't
 // responded within the hedge delay, a fallback request is started on the
-// next-best source. The first successful response wins.
+// next-best source. The first successful response wins. If both hedged
+// sources fail, remaining sources are tried sequentially to guarantee
+// that authoritative sources (like S3) are always reached.
 func (s *Scheduler) Fetch(ctx context.Context, pageNo int64) ([]byte, error) {
 	sources := s.sourcesForPage(pageNo)
 	if len(sources) == 0 {
@@ -118,6 +120,17 @@ func (s *Scheduler) Fetch(ctx context.Context, pageNo int64) ([]byte, error) {
 			}
 			return nil, ctx.Err()
 		}
+	}
+
+	// Both hedged sources failed. Try remaining sources sequentially.
+	// This ensures authoritative sources (e.g., S3 with completeness=1.0)
+	// are always reached, even when multiple peers claim HasPage but miss.
+	for _, src := range sources[2:] {
+		data, err := src.GetPage(ctx, pageNo)
+		if err == nil && data != nil {
+			return data, nil
+		}
+		lastErr = err
 	}
 	return nil, lastErr
 }
