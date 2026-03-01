@@ -122,6 +122,42 @@ func TestScheduler_NoSources(t *testing.T) {
 	}
 }
 
+func TestScheduler_MultiplePeersMiss_FallsBackToS3(t *testing.T) {
+	// Regression test: when 3+ peers claim HasPage but all return miss,
+	// the scheduler must still reach S3 (which is sorted last by latency).
+	makePeer := func(name string) *staticSource {
+		return &staticSource{
+			name:      name,
+			latency:   5 * time.Millisecond,
+			bandwidth: 500 * 1024 * 1024,
+			getPage: func(_ context.Context, pageNo int64) ([]byte, error) {
+				return nil, fmt.Errorf("%s: miss for page %d", name, pageNo)
+			},
+		}
+	}
+	s3 := &staticSource{
+		name:      "s3",
+		latency:   50 * time.Millisecond,
+		bandwidth: 100 * 1024 * 1024,
+		getPage: func(_ context.Context, _ int64) ([]byte, error) {
+			data := make([]byte, 4096)
+			data[0] = 0xAA
+			return data, nil
+		},
+	}
+
+	sched := NewScheduler(SchedulerConfig{HedgeDelay: 1 * time.Millisecond})
+	sched.SetSources([]Source{makePeer("peer1"), makePeer("peer2"), makePeer("peer3"), s3})
+
+	data, err := sched.Fetch(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("expected S3 fallback after all peers miss, got error: %v", err)
+	}
+	if data[0] != 0xAA {
+		t.Fatalf("expected S3 data, got 0x%02X", data[0])
+	}
+}
+
 func TestScheduler_PeerErrorFallsBackToS3(t *testing.T) {
 	peer := &staticSource{
 		name:      "peer",
