@@ -26,6 +26,12 @@ type PageCache interface {
 	Put(pageNo int64, data []byte)
 	PutPrefetched(pageNo int64, data []byte) // tracks waste on eviction
 	Has(pageNo int64) bool                   // non-stat-tracking existence check
+
+	// Epoch returns a counter incremented on every Clear(). Used by the
+	// Fetcher to detect stale prefetch puts: if the epoch changes between
+	// fetch start and completion, the fetched data may be from a previous
+	// page source version and the put is skipped.
+	Epoch() uint64
 }
 
 // FetchObserver receives notifications about page access and fetch events.
@@ -140,6 +146,11 @@ func (f *Fetcher) NotifyRead(pageNo int64, data []byte) {
 // uses PutPrefetched for waste tracking and does NOT trigger OnAccess (prevents
 // cascade).
 func (f *Fetcher) fetchInternal(ctx context.Context, pageNo int64, prefetched bool) ([]byte, error) {
+	// Capture cache epoch before starting the fetch. If a Clear() happens
+	// during the fetch (e.g., rebase), the epoch changes and we skip the
+	// cache put to avoid inserting stale data from the old page source.
+	epochAtStart := f.cache.Epoch()
+
 	// 1. Check / create in-flight future.
 	f.mu.Lock()
 	if fut, ok := f.inflight[pageNo]; ok {
@@ -172,8 +183,10 @@ func (f *Fetcher) fetchInternal(ctx context.Context, pageNo int64, prefetched bo
 		data, err = f.source.GetPage(ctx, pageNo)
 	}
 
-	// 4. Populate cache on success.
-	if err == nil && data != nil {
+	// 4. Populate cache on success — but only if the cache hasn't been
+	// cleared since we started fetching. A Clear() during the fetch means
+	// a rebase changed the page source; our data may be stale.
+	if err == nil && data != nil && f.cache.Epoch() == epochAtStart {
 		if prefetched {
 			f.cache.PutPrefetched(pageNo, data)
 		} else {

@@ -85,6 +85,8 @@ func (c *mockCache) Has(pageNo int64) bool {
 	return ok
 }
 
+func (c *mockCache) Epoch() uint64 { return 0 }
+
 func TestFetcher_BasicGetPage(t *testing.T) {
 	src := newMockSource(map[int64][]byte{
 		0: bytes.Repeat([]byte{0xAA}, 4096),

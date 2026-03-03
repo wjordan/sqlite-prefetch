@@ -34,6 +34,9 @@ type ReadaheadEngine struct {
 	fetcher *pagefault.Fetcher
 	cache   pagefault.PageCache
 
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	// Optional callback invoked after every successful fetch with the 0-based page number.
 	onPageFetched func(uint32)
 
@@ -65,14 +68,23 @@ func NewReadaheadEngine(
 	cfg ReadaheadConfig,
 ) *ReadaheadEngine {
 	cfg.withDefaults()
+	ctx, cancel := context.WithCancel(context.Background())
 	return &ReadaheadEngine{
 		btree:       sqlitebtree.NewTracker(1024),
 		overflowSet: make(map[uint32]bool),
 		fetcher:     fetcher,
 		cache:       cache,
+		ctx:         ctx,
+		cancel:      cancel,
 		workerSem:   make(chan struct{}, cfg.Workers),
 		scanIdx:     -1,
 	}
+}
+
+// Close cancels all in-flight and pending prefetch operations.
+// After Close returns, no new prefetches will be started.
+func (r *ReadaheadEngine) Close() {
+	r.cancel()
 }
 
 // SetOnPageFetched sets a callback invoked after every successful fetch
@@ -109,7 +121,9 @@ func (r *ReadaheadEngine) OnAccess(pageNo int64) {
 				int64Pages[i] = int64(p)
 			}
 			r.statBtreeHits.Add(1)
-			go r.submitBatch(int64Pages)
+			if r.ctx.Err() == nil {
+				go r.submitBatch(int64Pages)
+			}
 		}
 	}
 
@@ -158,7 +172,9 @@ func (r *ReadaheadEngine) onFetchLocked(pageNo int64, data []byte) {
 			if len(r.overflowSet) < 4096 {
 				r.overflowSet[next0] = true
 			}
-			go r.submitBatch([]int64{int64(next0)})
+			if r.ctx.Err() == nil {
+				go r.submitBatch([]int64{int64(next0)})
+			}
 		}
 		return
 	}
@@ -190,13 +206,16 @@ func (r *ReadaheadEngine) onFetchLocked(pageNo int64, data []byte) {
 				}
 				pages = append(pages, int64(ovfl0))
 			}
-			go r.submitBatch(pages)
+			if r.ctx.Err() == nil {
+				go r.submitBatch(pages)
+			}
 		}
 	}
 }
 
 // submitBatch prefetches pages with bounded concurrency. Skips pages
 // already in cache (using Has to avoid polluting hit/miss stats).
+// Returns immediately if the engine's context is cancelled.
 func (r *ReadaheadEngine) submitBatch(pages []int64) {
 	r.statSubmits.Add(1)
 	fetched := int64(0)
@@ -207,10 +226,16 @@ func (r *ReadaheadEngine) submitBatch(pages []int64) {
 			continue
 		}
 		fetched++
-		r.workerSem <- struct{}{} // acquire
+		select {
+		case r.workerSem <- struct{}{}: // acquire
+		case <-r.ctx.Done():
+			r.statPages.Add(fetched)
+			r.statSkipped.Add(skipped)
+			return
+		}
 		go func(pn int64) {
 			defer func() { <-r.workerSem }()
-			r.fetcher.Prefetch(context.Background(), pn)
+			r.fetcher.Prefetch(r.ctx, pn)
 		}(pg)
 	}
 	r.statPages.Add(fetched)

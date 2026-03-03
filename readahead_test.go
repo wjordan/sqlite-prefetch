@@ -84,6 +84,8 @@ func (c *mockCache) Has(pageNo int64) bool {
 	return ok
 }
 
+func (c *mockCache) Epoch() uint64 { return 0 }
+
 func TestReadaheadEngine_BtreeWithIndexPages(t *testing.T) {
 	src := newReadaheadTestSource(200)
 	cache := newMockCache()
