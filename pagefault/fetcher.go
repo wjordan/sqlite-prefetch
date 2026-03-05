@@ -1,11 +1,14 @@
 // Package pagefault provides a generic page-fault handler with in-flight
-// deduplication, caching, multi-source scheduling, and hedged requests.
+// deduplication, multi-source scheduling, and hedged requests.
 //
 // The Fetcher deduplicates concurrent requests for the same page through an
-// in-flight map, checks the cache first, and delegates to a Scheduler (when
-// available) or a direct PageSource for the actual fetch. A FetchObserver
-// receives notifications about page accesses and completed fetches, allowing
-// callers to implement readahead, prefetching, or other reactive behaviors.
+// in-flight map and delegates to a Scheduler (when available) or a direct
+// PageSource for the actual fetch. A FetchObserver receives notifications
+// about page accesses and completed fetches, allowing callers to implement
+// readahead, prefetching, or other reactive behaviors.
+//
+// The Fetcher does NOT cache results. Caching is the caller's responsibility
+// via version-keyed PageCache lookups in the VFS layer.
 package pagefault
 
 import (
@@ -17,21 +20,6 @@ import (
 // PageSource fetches page data from storage.
 type PageSource interface {
 	GetPage(ctx context.Context, pageNo int64) ([]byte, error)
-}
-
-// PageCache reads and writes cached pages.
-type PageCache interface {
-	Get(pageNo int64) ([]byte, bool)
-	CopyTo(pageNo int64, dst []byte) (int, bool)
-	Put(pageNo int64, data []byte)
-	PutPrefetched(pageNo int64, data []byte) // tracks waste on eviction
-	Has(pageNo int64) bool                   // non-stat-tracking existence check
-
-	// Epoch returns a counter incremented on every Clear(). Used by the
-	// Fetcher to detect stale prefetch puts: if the epoch changes between
-	// fetch start and completion, the fetched data may be from a previous
-	// page source version and the put is skipped.
-	Epoch() uint64
 }
 
 // FetchObserver receives notifications about page access and fetch events.
@@ -53,13 +41,11 @@ type pageFuture struct {
 }
 
 // Fetcher coordinates page fetches through an in-flight map to prevent
-// duplicate requests. It checks the cache first, then deduplicates fetches
-// to the underlying source (via Scheduler when available, or direct PageSource
-// as fallback).
+// duplicate requests. It delegates to a Scheduler (when available) or
+// direct PageSource as fallback, and notifies the observer on completion.
 type Fetcher struct {
 	source    PageSource
 	scheduler *Scheduler
-	cache     PageCache
 	observer  FetchObserver
 
 	mu         sync.Mutex
@@ -68,10 +54,9 @@ type Fetcher struct {
 }
 
 // New creates a Fetcher.
-func New(source PageSource, cache PageCache) *Fetcher {
+func New(source PageSource) *Fetcher {
 	return &Fetcher{
 		source:   source,
-		cache:    cache,
 		inflight: make(map[int64]*pageFuture),
 	}
 }
@@ -124,7 +109,7 @@ func (f *Fetcher) GetPage(ctx context.Context, pageNo int64) ([]byte, error) {
 }
 
 // Prefetch fetches a page without triggering OnAccess (prevents readahead
-// cascade). Uses PutPrefetched for waste tracking.
+// cascade).
 func (f *Fetcher) Prefetch(ctx context.Context, pageNo int64) ([]byte, error) {
 	return f.fetchInternal(ctx, pageNo, true)
 }
@@ -142,15 +127,8 @@ func (f *Fetcher) NotifyRead(pageNo int64, data []byte) {
 	}
 }
 
-// fetchInternal fetches a page with in-flight dedup. When prefetched is true,
-// uses PutPrefetched for waste tracking and does NOT trigger OnAccess (prevents
-// cascade).
+// fetchInternal fetches a page with in-flight dedup.
 func (f *Fetcher) fetchInternal(ctx context.Context, pageNo int64, prefetched bool) ([]byte, error) {
-	// Capture cache epoch before starting the fetch. If a Clear() happens
-	// during the fetch (e.g., rebase), the epoch changes and we skip the
-	// cache put to avoid inserting stale data from the old page source.
-	epochAtStart := f.cache.Epoch()
-
 	// 1. Check / create in-flight future.
 	f.mu.Lock()
 	if fut, ok := f.inflight[pageNo]; ok {
@@ -183,18 +161,7 @@ func (f *Fetcher) fetchInternal(ctx context.Context, pageNo int64, prefetched bo
 		data, err = f.source.GetPage(ctx, pageNo)
 	}
 
-	// 4. Populate cache on success — but only if the cache hasn't been
-	// cleared since we started fetching. A Clear() during the fetch means
-	// a rebase changed the page source; our data may be stale.
-	if err == nil && data != nil && f.cache.Epoch() == epochAtStart {
-		if prefetched {
-			f.cache.PutPrefetched(pageNo, data)
-		} else {
-			f.cache.Put(pageNo, data)
-		}
-	}
-
-	// 5. Notify observer about fetched page.
+	// 4. Notify observer about fetched page.
 	if err == nil && data != nil {
 		f.mu.Lock()
 		obs := f.observer
@@ -204,12 +171,12 @@ func (f *Fetcher) fetchInternal(ctx context.Context, pageNo int64, prefetched bo
 		}
 	}
 
-	// 6. Signal waiters that data is ready.
+	// 5. Signal waiters that data is ready.
 	fut.data = data
 	fut.err = err
 	close(fut.done)
 
-	// 7. Remove from in-flight map.
+	// 6. Remove from in-flight map.
 	f.mu.Lock()
 	delete(f.inflight, pageNo)
 	f.mu.Unlock()

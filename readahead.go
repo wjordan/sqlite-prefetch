@@ -21,6 +21,12 @@ func (c *ReadaheadConfig) withDefaults() {
 	}
 }
 
+// CacheChecker tests whether a page is already cached, used to skip
+// redundant prefetch submissions.
+type CacheChecker interface {
+	Has(pageNo int64) bool
+}
+
 // ReadaheadEngine predicts upcoming page accesses and prefetches them
 // asynchronously. It detects scans by observing two consecutive sibling
 // accesses under the same B-tree parent (analogous to Linux kernel
@@ -32,7 +38,7 @@ type ReadaheadEngine struct {
 	mu      sync.Mutex
 	btree   *sqlitebtree.Tracker
 	fetcher *pagefault.Fetcher
-	cache   pagefault.PageCache
+	cache   CacheChecker
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -64,7 +70,7 @@ var _ pagefault.FetchObserver = (*ReadaheadEngine)(nil)
 // NewReadaheadEngine creates a ReadaheadEngine.
 func NewReadaheadEngine(
 	fetcher *pagefault.Fetcher,
-	cache pagefault.PageCache,
+	cache CacheChecker,
 	cfg ReadaheadConfig,
 ) *ReadaheadEngine {
 	cfg.withDefaults()
