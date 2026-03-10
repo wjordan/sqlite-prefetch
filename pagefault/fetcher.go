@@ -17,7 +17,9 @@ import (
 	"sync/atomic"
 )
 
-// PageSource fetches page data from storage.
+// PageSource fetches page data from storage. Transaction identity is the
+// caller's responsibility — use a separate PageSource per read transaction
+// when snapshot consistency is required.
 type PageSource interface {
 	GetPage(ctx context.Context, pageNo int64) ([]byte, error)
 }

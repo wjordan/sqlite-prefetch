@@ -86,12 +86,25 @@ func (c *mockCache) Has(pageNo int64) bool {
 
 func (c *mockCache) Epoch() uint64 { return 0 }
 
+// cachingObserver wraps FetchObserver and populates the cache on OnFetch,
+// simulating the VFS layer's behavior (Fetcher doesn't cache directly).
+type cachingObserver struct {
+	inner pagefault.FetchObserver
+	cache *mockCache
+}
+
+func (o *cachingObserver) OnAccess(pageNo int64) { o.inner.OnAccess(pageNo) }
+func (o *cachingObserver) OnFetch(pageNo int64, data []byte) {
+	o.cache.Put(pageNo, data)
+	o.inner.OnFetch(pageNo, data)
+}
+
 func TestReadaheadEngine_BtreeWithIndexPages(t *testing.T) {
 	src := newReadaheadTestSource(200)
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	// Build interior index page (flag 0x02) with children 100-149.
 	indexChildren := make([]uint32, 50)
@@ -137,9 +150,9 @@ func TestReadaheadEngine_BtreeWithIndexPages(t *testing.T) {
 func TestReadaheadEngine_RandomNoTrigger(t *testing.T) {
 	src := newReadaheadTestSource(200)
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	// Simulate random page faults (not known btree children).
 	randoms := []int64{5, 100, 3, 150, 42, 199, 1, 88, 77, 12}
@@ -164,7 +177,7 @@ func TestReadaheadEngine_RandomNoTrigger(t *testing.T) {
 func TestReadaheadEngine_Reset(t *testing.T) {
 	src := newReadaheadTestSource(100)
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
 
 	// Build up some state.
@@ -188,7 +201,7 @@ func TestReadaheadEngine_Reset(t *testing.T) {
 func TestReadaheadEngine_BoundedWorkers(t *testing.T) {
 	src := newReadaheadTestSource(100)
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 
 	workers := 2
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: workers})
@@ -202,10 +215,10 @@ func TestReadaheadEngine_BoundedWorkers(t *testing.T) {
 func TestFetcher_GetPageTriggersOnAccess(t *testing.T) {
 	src := newReadaheadTestSource(100)
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 2})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	_, err := f.GetPage(context.Background(), 5)
 	if err != nil {
@@ -223,10 +236,10 @@ func TestFetcher_GetPageTriggersOnAccess(t *testing.T) {
 func TestFetcher_PrefetchSkipsOnAccess(t *testing.T) {
 	src := newReadaheadTestSource(100)
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 2})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	// Prefetch should NOT trigger OnAccess.
 	_, err := f.Prefetch(context.Background(), 5)
@@ -249,9 +262,9 @@ func TestFetcher_PrefetchSkipsOnAccess(t *testing.T) {
 func TestReadaheadEngine_BtreePrefetchesChildren(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	// Feed an interior page to the B-tree tracker. Page data contains 1-based
 	// SQLite pgno values; OnFetch converts to 0-based: [42, 17, 203, 8, 156].
@@ -283,9 +296,9 @@ func TestReadaheadEngine_BtreePrefetchesChildren(t *testing.T) {
 func TestReadaheadEngine_BtreeRandomPattern(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	// Feed an interior page with scattered children. Page data is 1-based;
 	// OnFetch converts to 0-based: [400, 50, 300, 150, 250, 100].
@@ -317,9 +330,9 @@ func TestReadaheadEngine_BtreeRandomPattern(t *testing.T) {
 func TestReadaheadEngine_ScanDetectsConsecutiveSiblings(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	// Interior page with children [10, 20, 30, 40, 50] (0-based).
 	btreeChildren := []uint32{11, 21, 31, 41, 51} // 1-based
@@ -354,9 +367,9 @@ func TestReadaheadEngine_ScanDetectsConsecutiveSiblings(t *testing.T) {
 func TestReadaheadEngine_PointSelectNoPrefetch(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	// Interior page with children [10, 20, 30, 40, 50] (0-based).
 	btreeChildren := []uint32{11, 21, 31, 41, 51}
@@ -387,9 +400,9 @@ func TestReadaheadEngine_PointSelectNoPrefetch(t *testing.T) {
 func TestReadaheadEngine_ScanFromNotifyRead(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	// Interior page with children [10, 20, 30, 40, 50] (0-based).
 	btreeChildren := []uint32{11, 21, 31, 41, 51}
@@ -424,9 +437,9 @@ func TestReadaheadEngine_ScanFromNotifyRead(t *testing.T) {
 func TestReadaheadEngine_NonConsecutiveNoPrefetch(t *testing.T) {
 	src := newReadaheadTestSource(500)
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	// Interior page with children [10, 20, 30, 40, 50] (0-based).
 	btreeChildren := []uint32{11, 21, 31, 41, 51}
@@ -488,9 +501,9 @@ func TestReadaheadEngine_OverflowFromLeafPage(t *testing.T) {
 		201: ovfl202,
 	}}
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	_, err := f.GetPage(context.Background(), 10)
 	if err != nil {
@@ -520,9 +533,9 @@ func TestReadaheadEngine_OverflowCascade(t *testing.T) {
 		301: ovfl302,
 	}}
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	_, err := f.GetPage(context.Background(), 10)
 	if err != nil {
@@ -567,9 +580,9 @@ func TestReadaheadEngine_OverflowWithBtreeInteraction(t *testing.T) {
 		599: ovfl600,
 	}}
 	cache := newMockCache()
-	f := pagefault.New(src, cache)
+	f := pagefault.New(src)
 	re := NewReadaheadEngine(f, cache, ReadaheadConfig{Workers: 4})
-	f.SetObserver(re)
+	f.SetObserver(&cachingObserver{inner: re, cache: cache})
 
 	_, err := f.GetPage(context.Background(), 2)
 	if err != nil {

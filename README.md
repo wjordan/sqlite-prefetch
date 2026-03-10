@@ -12,7 +12,7 @@ Traditional prefetchers use sequential or stride heuristics to guess what pages 
 
 SQLite's own [B-tree interior pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) already contain the answer: each interior page stores an array of child page pointers (typically ~450 per 4KB page). By parsing these pages as they're fetched, we can predict exactly which leaf pages will be needed next — no heuristics required. A single interior page hit yields all of its children, converging queries to 1-2 blocking faults per B-tree level regardless of fragmentation.
 
-The library combines this B-tree prediction with scan detection, multi-source scheduling, and peer routing into a composable set of components:
+The library combines this B-tree prediction with scan detection and multi-source scheduling into a composable set of components:
 
 | Component | Role |
 |---|---|
@@ -21,7 +21,6 @@ The library combines this B-tree prediction with scan detection, multi-source sc
 | **ReadaheadEngine** | Detects scans via two-consecutive-sibling accesses under the same B-tree parent, then prefetches remaining siblings. Point selects (single child access) trigger no prefetch. Delegates prediction to the B-tree tracker and overflow chain prefetcher. |
 | **btreeTracker** | Parses [interior B-tree pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) (table `0x05` and index `0x02`) for exact child-page prediction, with multi-level lookahead to stay ahead of SQLite's descent. |
 | **Overflow prefetcher** | Parses [leaf table pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) (`0x0D`) to find first overflow page numbers, then cascades through the linked-list chain via next-page pointers. |
-| **AvailabilityIndex** | Tracks which pages each peer has cached as [roaring64 bitmaps](https://github.com/RoaringBitmap/roaring) over a logical address space. Enables exact routing with zero convergence time. |
 
 Each component is optional. You can use just the `Prefetcher` for deduplication, add the `Scheduler` for multi-source fetching, or enable the full stack for autonomous B-tree-aware prefetching.
 
@@ -34,44 +33,48 @@ go get github.com/wjordan/sqlite-prefetch
 ## Usage
 
 ```go
-import "github.com/wjordan/sqlite-prefetch"
+import (
+    "github.com/wjordan/sqlite-prefetch"
+    "github.com/wjordan/sqlite-prefetch/pagefault"
+)
 
 // Implement these interfaces for your storage layer.
-var cache prefetch.PageCache   // Get/Put/Has for cached pages
-var source prefetch.PageSource // GetPage from your backend (S3, disk, etc.)
+var source pagefault.PageSource  // GetPage from your backend (S3, disk, etc.)
+var cache  prefetch.CacheChecker // Has() for skipping cached pages
 
-// Create the prefetcher.
-p := prefetch.New(source, cache)
+// Create the fetcher (deduplicates concurrent page faults).
+f := pagefault.New(source)
 
 // Optional: multi-source scheduling with hedged requests.
-sched := prefetch.NewScheduler(prefetch.SchedulerConfig{})
-sched.SetSources([]prefetch.Source{s3Source, peerSource})
-p.SetScheduler(sched)
+sched := pagefault.NewScheduler(pagefault.SchedulerConfig{})
+sched.SetSources([]pagefault.Source{s3Source, peerSource})
+f.SetScheduler(sched)
 
 // Optional: readahead with B-tree awareness.
-re := prefetch.NewReadaheadEngine(p, cache, prefetch.ReadaheadConfig{})
-p.SetReadahead(re)
+re := prefetch.NewReadaheadEngine(f, cache, prefetch.ReadaheadConfig{})
+f.SetObserver(re)
 
 // Fetch pages — dedup, readahead, and B-tree prediction happen automatically.
-data, err := p.GetPage(ctx, pageNo)
+data, err := f.GetPage(ctx, pageNo)
 ```
 
 ## Interfaces
 
-Integrate with your storage layer by implementing two interfaces:
+Integrate with your storage layer by implementing `PageSource`:
 
 ```go
 // PageSource fetches page data from storage.
 type PageSource interface {
     GetPage(ctx context.Context, pageNo int64) ([]byte, error)
 }
+```
 
-// PageCache reads and writes cached pages.
-type PageCache interface {
-    Get(pageNo int64) ([]byte, bool)
-    CopyTo(pageNo int64, dst []byte) (int, bool)
-    Put(pageNo int64, data []byte)
-    PutPrefetched(pageNo int64, data []byte) // tracks waste on eviction
+Transaction identity is the caller's responsibility — use a separate `PageSource` per read transaction when snapshot consistency is required.
+
+For readahead, implement `CacheChecker` so the engine can skip pages already cached:
+
+```go
+type CacheChecker interface {
     Has(pageNo int64) bool
 }
 ```
@@ -83,18 +86,8 @@ type Source interface {
     Name() string
     Latency() time.Duration
     Bandwidth() float64
-    Completeness() float64
-    EgressCost() float64
     HasPage(pageNo int64) bool
     GetPage(ctx context.Context, pageNo int64) ([]byte, error)
-}
-```
-
-For peer-to-peer fetching, implement `PeerTransport`:
-
-```go
-type PeerTransport interface {
-    OpenStream(ctx context.Context, addr string) (io.ReadWriteCloser, error)
 }
 ```
 
@@ -128,20 +121,10 @@ The overflow prefetcher handles this by parsing leaf table pages (`0x0D`) when t
 
 The `Scheduler` implements [hedged requests](https://research.google/pubs/the-tail-at-scale/) from Google's "The Tail at Scale" (Dean & Barroso, 2013). It starts the best source immediately and fires a fallback after `1.5x best_latency`. The first successful response wins; the other is cancelled.
 
-### Peer availability gossip
-
-Peers exchange page availability using [roaring64 bitmaps](https://github.com/RoaringBitmap/roaring) over physical page numbers. The `AvailabilityIndex` stores one roaring64 bitmap per peer; `LocalAvailability` maintains a single bitmap for the local node. Peer removal is O(1) (delete the bitmap).
-
-Exchange uses QUIC streams (reliable full snapshots on peer join, periodic resync) and datagrams (unreliable 7-byte deltas on cache changes). Since availability is known upfront, routing achieves 100% hit rate immediately — no convergence period.
-
 ## References
 
 - [SQLite Database File Format](https://www.sqlite.org/fileformat2.html) -- page layout, B-tree structure, interior page format, overflow pages
 - [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) (Dean & Barroso, 2013) -- hedged requests for tail latency
-
-## Dependencies
-
-- [roaring](https://github.com/RoaringBitmap/roaring) (Apache-2.0) — compressed bitmap data structure for peer availability tracking
 
 ## License
 

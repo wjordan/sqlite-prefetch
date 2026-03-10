@@ -40,60 +40,12 @@ func (s *mockSource) GetPage(ctx context.Context, pageNo int64) ([]byte, error) 
 	return make([]byte, 4096), nil
 }
 
-type mockCache struct {
-	mu    sync.Mutex
-	pages map[int64][]byte
-}
-
-func newMockCache() *mockCache {
-	return &mockCache{pages: make(map[int64][]byte)}
-}
-
-func (c *mockCache) Get(pageNo int64) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	d, ok := c.pages[pageNo]
-	return d, ok
-}
-
-func (c *mockCache) CopyTo(pageNo int64, dst []byte) (int, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	d, ok := c.pages[pageNo]
-	if !ok {
-		return 0, false
-	}
-	return copy(dst, d), true
-}
-
-func (c *mockCache) Put(pageNo int64, data []byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	cp := make([]byte, len(data))
-	copy(cp, data)
-	c.pages[pageNo] = cp
-}
-
-func (c *mockCache) PutPrefetched(pageNo int64, data []byte) {
-	c.Put(pageNo, data)
-}
-
-func (c *mockCache) Has(pageNo int64) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	_, ok := c.pages[pageNo]
-	return ok
-}
-
-func (c *mockCache) Epoch() uint64 { return 0 }
-
 func TestFetcher_BasicGetPage(t *testing.T) {
 	src := newMockSource(map[int64][]byte{
 		0: bytes.Repeat([]byte{0xAA}, 4096),
 		1: bytes.Repeat([]byte{0xBB}, 4096),
 	})
-	cache := newMockCache()
-	f := New(src, cache)
+	f := New(src)
 
 	data, err := f.GetPage(context.Background(), 0)
 	if err != nil {
@@ -111,8 +63,7 @@ func TestFetcher_DeduplicatesConcurrent(t *testing.T) {
 	src := newMockSource(map[int64][]byte{
 		0: bytes.Repeat([]byte{0xFF}, 4096),
 	})
-	cache := newMockCache()
-	f := New(src, cache)
+	f := New(src)
 
 	// Pre-register an in-flight future for page 0.
 	fut := &pageFuture{done: make(chan struct{})}
@@ -160,8 +111,7 @@ func TestFetcher_ContextCancellation(t *testing.T) {
 	})
 	src.delays = map[int64]chan struct{}{0: delay}
 
-	cache := newMockCache()
-	f := New(src, cache)
+	f := New(src)
 
 	// Start a fetch that will block.
 	go func() {
@@ -180,20 +130,18 @@ func TestFetcher_ContextCancellation(t *testing.T) {
 	close(delay)
 }
 
-func TestFetcher_PopulatesCacheAfterFetch(t *testing.T) {
+func TestFetcher_ReturnsDataFromSource(t *testing.T) {
 	src := newMockSource(map[int64][]byte{
 		3: bytes.Repeat([]byte{0xDD}, 4096),
 	})
-	cache := newMockCache()
-	f := New(src, cache)
+	f := New(src)
 
-	_, err := f.GetPage(context.Background(), 3)
+	data, err := f.GetPage(context.Background(), 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if _, ok := cache.Get(3); !ok {
-		t.Fatal("expected page 3 to be in cache after fetch")
+	if data[0] != 0xDD {
+		t.Fatalf("got 0x%02x, want 0xDD", data[0])
 	}
 }
 
@@ -220,8 +168,7 @@ func TestFetcher_ObserverNotifications(t *testing.T) {
 	src := newMockSource(map[int64][]byte{
 		5: bytes.Repeat([]byte{0xAA}, 4096),
 	})
-	cache := newMockCache()
-	f := New(src, cache)
+	f := New(src)
 	obs := &mockObserver{}
 	f.SetObserver(obs)
 
@@ -245,15 +192,17 @@ func TestFetcher_PrefetchSkipsOnAccess(t *testing.T) {
 	src := newMockSource(map[int64][]byte{
 		5: bytes.Repeat([]byte{0xAA}, 4096),
 	})
-	cache := newMockCache()
-	f := New(src, cache)
+	f := New(src)
 	obs := &mockObserver{}
 	f.SetObserver(obs)
 
 	// Prefetch should NOT trigger OnAccess, but should trigger OnFetch.
-	_, err := f.Prefetch(context.Background(), 5)
+	data, err := f.Prefetch(context.Background(), 5)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if data[0] != 0xAA {
+		t.Fatalf("got 0x%02x, want 0xAA", data[0])
 	}
 
 	obs.mu.Lock()
@@ -264,17 +213,11 @@ func TestFetcher_PrefetchSkipsOnAccess(t *testing.T) {
 	if len(obs.fetches) != 1 || obs.fetches[0] != 5 {
 		t.Fatalf("expected OnFetch(5), got %v", obs.fetches)
 	}
-
-	// Should be cached as prefetched.
-	if _, ok := cache.Get(5); !ok {
-		t.Fatal("expected page 5 to be cached")
-	}
 }
 
 func TestFetcher_NotifyRead(t *testing.T) {
 	src := newMockSource(nil)
-	cache := newMockCache()
-	f := New(src, cache)
+	f := New(src)
 	obs := &mockObserver{}
 	f.SetObserver(obs)
 
